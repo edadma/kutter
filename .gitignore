@@ -1,0 +1,9 @@
+target/
+.bsp/
+.bloop/
+.metals/
+.idea/
+*.class
+*.log
+.DS_Store
+probe*.png

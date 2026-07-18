@@ -1,0 +1,40 @@
+# A kutter lower-thirds list (.klt) — a HOCON document you Import into a project. Editing this file and
+# re-importing it replaces the lower thirds it produced before, so it stays the source of truth for them.
+#
+# Each entry becomes one faded lower third. `name`, `in`, and `out` are required; `title`, `fade`
+# (in frames), and `style` are optional. Times are timecodes ("m:ss", "m:ss.cc", "h:mm:ss" — quote
+# them, since HOCON reads ":" as a separator) or plain seconds (3, 3.5, or 3.5s). `style` names one
+# of the project's styles (broadcast-blue, bold-bar, minimal, texish-card); a row without one takes the
+# first. The texish-card style typesets its card with the texish engine (real kerning, chosen fonts)
+# instead of the hand-drawn look — the card's whole appearance lives in that style's texish template.
+#
+# A row can also carry its own `body`: a raw texish document (as a triple-quoted string) that becomes
+# that one card's whole look, overriding its style. The words are handed to it as \the\ltname and
+# \the\lttitle, so a body can read them or set the card however it likes.
+
+# The windows below are spaced to fit within the bundled 20-second clip, one card at a time, so each
+# is clearly visible; Import adds them to whatever is already on the timeline, so start from an empty
+# project (or clear the demo cards) to see just these.
+
+lowerThirds = [
+  { name = "Big Buck Bunnyasdf", title = "an open movie by the Blender Foundation", in = "0:00.5", out = "0:03.5" }
+  { name = "Directed by",    title = "Sacha Goedegebure",  in = "0:04", out = "0:07", style = bold-bar }
+  { name = "Music",          title = "Jan Morgenstern",    in = "0:07.5", out = "0:10.5", style = minimal, fade = 18 }
+  { name = "Typeset by",     title = "the texish engine",  in = "0:11", out = "0:14", style = texish-card }
+
+  # A one-off card written entirely in texish — gold bold name over an italic line, self-contained.
+  { name = "Story", in = "0:14.5", out = "0:17.5", fade = 15, body = """
+      \use{document}
+      \geometry margin:0
+      \def footline {}
+      \set leftskip {56}
+      \vfill
+      \noindent{\color{#ffd24a}\font lmroman 52 {sans bold}\the\ltname}
+
+      \vskip 6pt
+
+      \noindent{\color{white}\font lmroman 26 {sans italic}hand-written in texish}
+
+      \vskip 60pt
+  """ }
+]

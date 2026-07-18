@@ -1,0 +1,195 @@
+package io.github.edadma.kutter
+
+import io.github.edadma.suit.*
+
+// The timeline: the editor's spine. It is not one widget but several — a pinned time ruler across the
+// top and one widget per track below it — composed in `Main` into the track panel, with the tracks in
+// a scroll view so a tall stack scrolls while the ruler stays put. This object holds the shared
+// geometry and the per-widget painters; each track paints its own clips and its own segment of the
+// playhead, and because every widget shares the same width and time mapping the segments line up into
+// one continuous playhead. The base video track plus, in time, the overlay tracks the lower thirds
+// ride on are just more entries in that stack.
+object Timeline:
+
+  val RulerHeight = 22.0 // the time-ruler widget's height
+  val TrackHeight = 68.0 // one track widget's height
+  val LabelWidth  = 60.0 // the track-name column down the left, as in any editor; the ruler leaves it blank
+
+  /** One lower third's block on the titles lane: its window on the timeline, a caption, the colour it
+    * wears (drawn from its style), and whether it is the selected one. */
+  case class OverlayBlock(
+      id:       String,
+      inFrame:  Int,
+      outFrame: Int,
+      label:    String,
+      color:    Color,
+      selected: Boolean,
+  )
+
+  /** One track: a named lane and what rides on it. A media track spans a single clip of `lengthFrames`
+    * frames from the start of the timeline and carries either a filmstrip (`thumbs`, a video clip) or a
+    * waveform overview (`waveform`, an audio clip); the titles lane carries a set of lower-third
+    * `overlays` instead. A track sets whichever one it draws. */
+  case class Track(
+      name:         String,
+      lengthFrames: Int,
+      thumbs:       Thumbnails | Null        = null,
+      waveform:     Waveform | Null          = null,
+      overlays:     Seq[OverlayBlock] | Null = null,
+  )
+
+  /** The frame-count-to-x mapping for a widget `width` wide holding `total` frames. */
+  private def xOf(frame: Double, total: Int, width: Double): Double =
+    (frame / math.max(1, total)) * width
+
+  /** The inverse: the frame under widget-local x `px`, clamped. Turns a cursor position into a seek. */
+  def frameAt(px: Double, total: Int, width: Double): Int =
+    val f = math.round((px / math.max(1.0, width)) * total).toInt
+    math.max(0, math.min(total - 1, f))
+
+  /** Where a dragged title block's in-frame lands: its `origIn` shifted by how far the cursor has
+    * moved from where it grabbed (`curFrame - grabFrame`), then clamped so the whole block (length
+    * `len`) stays within `[0, total)`. Keeps the block's length and never lets it run off either end. */
+  def dragPlacement(origIn: Int, len: Int, grabFrame: Int, curFrame: Int, total: Int): Int =
+    math.max(0, math.min(total - 1 - len, origIn + (curFrame - grabFrame)))
+
+  /** The id of the topmost overlay block under widget-local x `px`, if any — how a click on the titles
+    * lane picks a lower third. Blocks are tested back-to-front so the one drawn on top wins when two
+    * windows overlap. */
+  def overlayAt(px: Double, total: Int, width: Double, blocks: Seq[OverlayBlock]): Option[String] =
+    blocks.reverseIterator
+      .find(b => px >= xOf(b.inFrame, total, width) && px <= xOf(b.outFrame, total, width))
+      .map(_.id)
+
+  private def playheadInk(theme: Theme): Color = theme.accent
+
+  /** A readable ink for a caption over `bg`: black on a light block, white on a dark one. */
+  private def readableInk(bg: Color): Color =
+    if 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b > 150 then Color.black else Color.white
+
+  /** Paint the ruler widget: a faint band with a tick and a centred m:ss label at a spacing that
+    * stays uncrowded on a short window, plus the playhead's grip and top line. */
+  def paintRuler(cv: Canvas, size: Size, total: Int, position: Int, theme: Theme): Unit =
+    val w       = size.width
+    val rulerBg = if theme.isDark then Color.rgb(0x22262a) else Color.rgb(0xd0d4d8)
+    cv.fillRect(Rect(0, 0, w, size.height), rulerBg)
+
+    val fps        = 30.0
+    val totalSecs  = total / fps
+    val minTickPx  = 56.0
+    val secPerPx   = totalSecs / math.max(1.0, w)
+    val step       = math.max(1, math.ceil(minTickPx * secPerPx).toInt)
+    val tickInk    = theme.border
+    val labelInk   = if theme.isDark then Color.rgb(0x8b9096) else Color.rgb(0x60656a)
+    val labelStyle = TextStyle(11.0, labelInk)
+    var s          = 0
+    while s <= totalSecs.toInt do
+      val x     = xOf(s * fps, total, w)
+      val label = f"${s / 60}:${s % 60}%02d"
+      val lw    = cv.measureText(label, labelStyle).width
+      val tx    = math.max(1.0, math.min(w - lw - 1.0, x - lw / 2))
+      cv.line(Offset(x, size.height - 6), Offset(x, size.height), 1.0, tickInk)
+      cv.drawText(Offset(tx, 3), label, labelStyle)
+      s += step
+
+    val px   = xOf(position, total, w)
+    val head = playheadInk(theme)
+    cv.fillRect(Rect(px - 0.5, 8, 1.5, size.height - 8), head)
+    cv.fillPath(Path.polyline(Seq(Offset(px - 5, 0), Offset(px + 5, 0), Offset(px, 8))), head)
+
+  /** Paint one track widget: its clip blocks (a filmstrip where the strip is ready, flat otherwise),
+    * each with a bright top cap, a border, and the clip's name — and the playhead line over them. */
+  def paintTrack(cv: Canvas, size: Size, track: Track, total: Int, position: Int, theme: Theme): Unit =
+    val w  = size.width
+    val h  = size.height
+    val bh = h - 4 // the clip block's height, inset so stacked tracks read as separate lanes
+
+    val laneBg   = if theme.isDark then Color.rgb(0x16191c) else Color.rgb(0xe3e6e9)
+    val blockCol = if theme.isDark then Color.rgb(0x2f5d8a) else Color.rgb(0xa5c8ec)
+    val blockTop = theme.primary
+    val radius   = BorderRadius.all(6)
+    cv.fillRect(Rect(0, 0, w, h), laneBg)
+
+    // The titles lane paints lower-third blocks instead of clips and returns early.
+    val overlays = track.overlays
+    if overlays != null then
+      paintOverlays(cv, overlays, total, w, bh, theme)
+      val hx = xOf(position, total, w)
+      cv.fillRect(Rect(hx - 0.5, 0, 1.5, h), playheadInk(theme))
+      return
+
+    val audioBg  = if theme.isDark then Color.rgb(0x24303a) else Color.rgb(0xd4e2ee)
+    val waveInk  = if theme.isDark then Color.rgb(0x74c0fc) else Color.rgb(0x3b7bb8)
+
+    // A media lane draws a single block spanning its clip, from the start of the timeline to its length.
+    if track.lengthFrames > 0 then
+      val x1   = 0.0
+      val x2   = xOf(track.lengthFrames, total, w)
+      val bw   = math.max(2.0, x2 - x1 - 2)
+      val span = math.max(1.0, x2 - x1)
+      val r    = Rect(x1 + 1, 2, bw, bh)
+
+      track.waveform match
+        case wf: Waveform =>
+          // An audio lane: the peak envelope mirrored around the block's midline.
+          cv.fillRoundedRect(r, radius, audioBg)
+          cv.pushClip(r, radius)
+          val mid   = 2 + bh / 2
+          val halfH = (bh / 2) * 0.88
+          cv.fillRect(Rect(x1 + 1, mid - 0.25, bw, 0.5), waveInk) // centre line
+          var sx = x1 + 1
+          while sx < x2 - 1 do
+            val hh = wf.at((sx - x1) / span) * halfH
+            if hh > 0.3 then cv.fillRect(Rect(sx, mid - hh, 1.3, hh * 2), waveInk)
+            sx += 1.6
+          cv.popClip()
+          cv.strokeRoundedRect(r, radius, theme.border, 1.0)
+
+        case null =>
+          // A video lane: a filmstrip where the strip is ready, flat otherwise, with a bright cap.
+          track.thumbs match
+            case t: Thumbnails =>
+              cv.fillRoundedRect(r, radius, blockCol)
+              cv.pushClip(r, radius)
+              val tw = math.max(8.0, bh * 16.0 / 9.0)
+              var sx = x1 + 1
+              while sx < x2 - 1 do
+                t.at((sx - x1) / span) match
+                  case img: RasterImage => cv.drawImage(img, Rect(sx, 2, tw, bh))
+                  case null             => ()
+                sx += tw
+              cv.popClip()
+            case null =>
+              cv.fillRoundedRect(r, radius, blockCol)
+          cv.fillRoundedRect(Rect(x1 + 1, 2, bw, 4), BorderRadius.all(2), blockTop)
+          cv.strokeRoundedRect(r, radius, theme.border, 1.0)
+
+    val px = xOf(position, total, w)
+    cv.fillRect(Rect(px - 0.5, 0, 1.5, h), playheadInk(theme))
+
+  /** Paint the titles lane: each lower third as a rounded block across its in/out window, filled with
+    * its style's colour and captioned with its name. The selected block is ringed in the primary
+    * colour so it reads as the inspector's subject; the others carry a plain border. */
+  private def paintOverlays(
+      cv: Canvas, blocks: Seq[OverlayBlock], total: Int, w: Double, bh: Double, theme: Theme,
+  ): Unit =
+    val radius = BorderRadius.all(6)
+    for b <- blocks do
+      val x1 = xOf(b.inFrame, total, w)
+      val x2 = xOf(b.outFrame, total, w)
+      val bw = math.max(2.0, x2 - x1 - 2)
+      val r  = Rect(x1 + 1, 2, bw, bh)
+      cv.fillRoundedRect(r, radius, b.color)
+
+      val ink   = readableInk(b.color)
+      val style = TextStyle(11.0, ink)
+      cv.pushClip(r, radius)
+      val pad   = 6.0
+      val label = b.label
+      val lw    = cv.measureText(label, style).width
+      if lw <= bw - pad * 2 || bw > 40 then
+        cv.drawText(Offset(x1 + 1 + pad, 2 + (bh - 11) / 2), label, style)
+      cv.popClip()
+
+      if b.selected then cv.strokeRoundedRect(r, radius, theme.primary, 2.0)
+      else cv.strokeRoundedRect(r, radius, theme.border, 1.0)
