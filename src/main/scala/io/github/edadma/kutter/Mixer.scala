@@ -11,6 +11,15 @@ object Mixer:
   def gainToDb(gain: Double): Double =
     if gain <= 0.0 then Double.NegativeInfinity else 20.0 * math.log10(gain)
 
+  // The dB level fed to a fully-attenuating fader (linear gain 0) — well below audible, standing in for
+  // the −∞ that a real gain of 0 would be, since the MLT `volume` filter's `level` takes a finite dB.
+  private val SilenceDb = -1000.0
+
+  /** The dB value to write to an MLT `volume` filter's `level` for a linear `gain`. Same as `gainToDb`,
+    * but silence (gain 0) floors to a large finite negative rather than −∞, so the property is settable. */
+  def levelDb(gain: Double): Double =
+    if gain <= 0.0 then SilenceDb else 20.0 * math.log10(gain)
+
   /** A short decibel readout for a linear `gain`, for the fader's label: `-∞ dB` at silence, `0.0 dB` at
     * unity, and a signed value either side (`-6.0 dB`, `+6.0 dB`). Feeding a track's effective gain here
     * — 0 when muted — makes a muted fader read `-∞ dB`. */

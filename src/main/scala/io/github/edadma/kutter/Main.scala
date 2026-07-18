@@ -282,16 +282,37 @@ private val App: Component[Session] = component[Session] { initial =>
   )
 
   // Push each edit to the player. The mount ref skips the first run (on mount the project still equals
-  // the one just opened). If there is no player yet but the project has gained content — a lower third
-  // imported or added into an empty project — open one now, so the preview appears without a video.
-  val edited = useRef(false)
+  // the one just opened). An edit that leaves the graph's structure alone — only a track's gain or the
+  // master level changed — is applied **live** (the master to the audio device, a track's gain to its
+  // volume filter) so riding a fader never interrupts playback; anything that changes the media or the
+  // lower thirds rebuilds the graph. If there is no player yet but the project has gained content — a
+  // lower third imported or added into an empty project — open one now, so the preview appears.
+  // The project's graph-shaping signature: the media arrangement (each track's kind and its placements'
+  // source/in/length/start) and the lower thirds — but NOT the gains. Two projects with the same
+  // signature compile to the same graph, so a change that only moved a fader can be told apart from one
+  // that needs a rebuild.
+  def graphSig(p: Project): Any =
+    (p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart)))),
+     p.lowerThirds)
+
+  val edited     = useRef(false)
+  val lastPushed = useRef(initial.project)
   useEffect(
     () =>
       if edited.current then
         playerRef.current match
-          case p: Player => p.update(project)
-          case null      => if hasContent(project) then openPlayerFor(project)
-      else edited.current = true
+          case p: Player =>
+            val prev = lastPushed.current
+            if graphSig(project) == graphSig(prev) then
+              if project.master != prev.master then p.setVolume(project.master)
+              for t <- project.audioTracks do
+                if !prev.tracks.find(_.id == t.id).exists(_.gain == t.gain) then p.setTrackGain(t.id, t.gain)
+            else p.update(project)
+          case null => if hasContent(project) then openPlayerFor(project)
+        lastPushed.current = project
+      else
+        edited.current     = true
+        lastPushed.current = project
       () => ()
     ,
     Array(project),

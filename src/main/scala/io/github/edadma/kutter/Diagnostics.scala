@@ -93,6 +93,57 @@ private[kutter] object Diagnostics:
         return true
       case None => ()
 
+    // `KUTTER_PROBE_AUDIO=<source.wav>` renders that source through the real playback graph to a WAV
+    // (`KUTTER_AUDIO_OUT`, default /tmp/kutter-audio-out.wav) for offline analysis of the audio the graph
+    // actually produces. `KUTTER_AUDIO_MODE` picks the graph shape: `graph` (default — one clip on an
+    // audio track, the black base + mix, exactly as the app plays it), `twoclip` (two placements
+    // sequenced, to expose a seam), or `lt` (with a lower third, to expose compositing overhead).
+    sys.env.get("KUTTER_PROBE_AUDIO") match
+      case Some(src) =>
+        Mlt.init()
+        val out  = sys.env.getOrElse("KUTTER_AUDIO_OUT", "/tmp/kutter-audio-out.wav")
+        val mode = sys.env.getOrElse("KUTTER_AUDIO_MODE", "graph")
+        val len  = Player.mediaLength(src)
+        val clip = MediaClip.make(src, MediaKind.Audio, len)
+        val proj = mode match
+          case "twoclip" =>
+            Project.blank.copy(bin = List(clip), tracks = List(
+              Track("a1", "A1", MediaKind.Audio, List(
+                PlacedClip.make(clip.id, 0, len / 2),
+                PlacedClip.make(clip.id, len / 2, len - len / 2),
+              )),
+            ))
+          case "lt" =>
+            Project.blank.copy(bin = List(clip),
+              tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len)))),
+              lowerThirds = List(LowerThird("t", "Name", "Title", 0, math.max(1, len - 1))))
+          case "full" =>
+            // Mimic the project monitor: a video clip composited on V1, the tone mixed on A1, and three
+            // lower-third card composites — the graph shape the interference appears in.
+            val vsrc  = sys.env.getOrElse("KUTTER_AUDIO_VIDEO", "big_buck_bunny_720p.mp4")
+            val vlen  = Player.mediaLength(vsrc)
+            val vclip = MediaClip.make(vsrc, MediaKind.Video, vlen)
+            Project.blank.copy(
+              bin = List(clip, vclip),
+              tracks = List(
+                Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(vclip.id, 0, math.min(vlen, len)))),
+                Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len))),
+              ),
+              lowerThirds = List(
+                LowerThird("t1", "One", "a", 0, len / 3),
+                LowerThird("t2", "Two", "b", len / 3, 2 * len / 3),
+                LowerThird("t3", "Three", "c", 2 * len / 3, math.max(1, len - 1)),
+              ),
+            )
+          case _ =>
+            Project.blank.copy(bin = List(clip),
+              tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len)))))
+        Player.renderAudio(proj, out)
+        Mlt.close()
+        println(s"rendered audio ($mode, $len frames) -> $out")
+        return true
+      case None => ()
+
     // `KUTTER_PROBE_HIT` checks the timeline's pure click-mapping and drag math — `frameAt` (cursor x →
     // frame), `overlayAt`/`clipAt` (cursor x → the lower third or clip under it), `dragPlacement` (a
     // title's new window), and `clipStartBounds` (how far a placed clip may slide within its gap) —
@@ -247,6 +298,10 @@ private[kutter] object Diagnostics:
       check("dbLabel silence", Mixer.dbLabel(0.0), "-∞ dB")
       check("dbLabel half", Mixer.dbLabel(0.5), "-6.0 dB")
       check("dbLabel double", Mixer.dbLabel(2.0), "+6.0 dB")
+      // levelDb feeds the volume filter's `level`: unity is 0 dB, and silence floors to a large finite
+      // negative (not −∞) so the property stays settable.
+      check("levelDb unity", Mixer.levelDb(1.0), 0.0)
+      check("levelDb silence finite", Mixer.levelDb(0.0) < -100.0, true)
 
       // Re-import replaces: lower thirds tagged with a source file are swapped out (not appended to) when
       // that same file is imported again; overlays from other files or added by hand are untouched.

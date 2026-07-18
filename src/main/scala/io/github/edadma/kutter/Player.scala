@@ -14,6 +14,15 @@ private val AudioRate           = 48000
 private val AudioChannels       = 2
 private val AudioBytesPerSample = AudioChannels * 4
 
+// How much audio (per channel) to keep buffered ahead of the picture at the device — a quarter second.
+// The decoder runs ahead to maintain this reserve, and each decoded picture is shown when its audio
+// actually reaches the speakers, so the reserve deepens the buffer without pushing sound out of sync
+// with the picture. It is what lets a GC pause or a heavy render frame pass without starving the device
+// (the cause of clicks/pulsing on a shallow one-frame buffer). Audio is the clock: a dropped or repeated
+// picture goes unnoticed, but a gap in the sound is heard.
+private val AudioLeadSamples  = AudioRate / 4
+private val MaxBufferedFrames = 24 // safety cap on decoded frames held ahead, so a stall can't grow it unbounded
+
 // The playback profile the graph renders against, and the filmstrip the timeline shows: a spread of
 // small 16:9 thumbnails decoded once when a video track opens.
 private val ProfileName = "atsc_720p_30"
@@ -50,6 +59,7 @@ final class Player(
     audio:    AudioStream,
     thumbCache: Map[String, Thumbnails],
     waveCache:  Map[String, Waveform],
+    initialVolumeFilters: Map[String, Filter],
     initialCloseGraph: () => Unit,
 ):
   private val log = LoggerFactory.getLogger
@@ -62,6 +72,18 @@ final class Player(
   // owns a background thread; moving a clip does not, so its generators carry over the live swap.
   private var graph:        Producer   = initialGraph
   private var closeGraph:   () => Unit = initialCloseGraph
+
+  // The audio tracks' `volume` filters, keyed by track id, so the mixer can ride a track's gain live —
+  // setting the filter's `gain` property on the running graph rather than rebuilding it, which would
+  // recreate every producer and reseek and so stutter playback. Every audio track carries one (even at
+  // unity), so a fader always has a handle. Swapped in with the graph; touched only by the decode thread.
+  private var volumeFilters: Map[String, Filter] = initialVolumeFilters
+
+  // Track-gain changes parked by the UI thread for the decode thread to apply between frames — the same
+  // hand-off shape as `pendingGraph`, but a live property tweak with no rebuild. A later change to a
+  // track supersedes an earlier unapplied one; `gainLock` guards the map.
+  @volatile private var pendingGains: Map[String, Double] = Map.empty
+  private val gainLock = new AnyRef
 
   /** The filmstrip generator for the video source at `path`, or null when none was opened for it — the
     * timeline looks a clip block's strip up by source, so several placements of one clip share it. */
@@ -86,7 +108,7 @@ final class Player(
   // NSException off the main thread — so the build cannot happen on the decode thread. A newer edit
   // supersedes an unswapped one, whose graph is freed so a burst of edits does not leak; `swapLock`
   // guards the hand-off.
-  private case class PendingGraph(graph: Tractor, close: () => Unit)
+  private case class PendingGraph(graph: Tractor, volumeFilters: Map[String, Filter], close: () => Unit)
   @volatile private var pendingGraph: PendingGraph | Null = null
   private val swapLock = new AnyRef
 
@@ -98,6 +120,15 @@ final class Player(
   // (per channel) pushed to the stream since the last rewind, and whether the timeline has audio at all.
   private var pushedSamples: Long = 0L
   private var hasAudio            = false
+
+  // Decoded frames waiting to be shown, each tagged with the sample position where its audio begins. The
+  // decoder runs ahead of the picture to keep `AudioLeadSamples` buffered at the device; a frame is shown
+  // once the device has played up to its audio, keeping picture and sound in step. `reachedEnd` records
+  // that the timeline ran out while filling, so the queue is drained before playback truly stops. Touched
+  // only by the decode thread.
+  private final case class PendingFrame(frame: Frame, startSample: Long)
+  private val displayQueue = scala.collection.mutable.Queue.empty[PendingFrame]
+  private var reachedEnd   = false
 
   /** Total number of frames on the timeline. */
   val totalFrames: Int = math.max(1, graph.length)
@@ -118,8 +149,15 @@ final class Player(
       pendingGraph match
         case p: PendingGraph => p.close()
         case null            => ()
-      pendingGraph = PendingGraph(built.tractor, built.close)
+      pendingGraph = PendingGraph(built.tractor, built.volumeFilters, built.close)
     }
+
+  /** Ride an audio track's fader live: park the new linear gain for the decode thread to apply to the
+    * track's `volume` filter between frames. No graph rebuild, so playback is not interrupted — the
+    * change is heard on the next frame. Silently ignores a track with no volume filter (a video track).
+    * Safe to call from the UI thread. */
+  def setTrackGain(trackId: String, gain: Double): Unit =
+    gainLock.synchronized { pendingGains = pendingGains + (trackId -> gain) }
 
   /** The playback position to show. Normally the frame most recently shown (0 .. totalFrames-1); it
     * snaps to the full length once the timeline has ended (so the readout lands on 0:20 / 0:20), and
@@ -174,6 +212,7 @@ final class Player(
     thread match
       case t: Thread => t.join()
       case null      => ()
+    flushQueue() // close any decoded frames still queued for display
     thumbCache.values.foreach(_.close())
     waveCache.values.foreach(_.close())
     audio.pause()
@@ -182,8 +221,6 @@ final class Player(
     consumer.close()
     closeGraph()
     profile.close()
-
-  private var traceN = 0
 
   private def decodeLoop(): Unit =
     log.debug("decode thread started", category = "player")
@@ -197,13 +234,23 @@ final class Player(
         case p: PendingGraph => swapGraph(p)
         case null            => ()
 
+      // Apply any parked track-gain changes to the running graph's volume filters — a live property
+      // tweak, no reseek, so riding a fader does not interrupt the picture or the sound.
+      val gains = gainLock.synchronized {
+        val g = pendingGains
+        pendingGains = Map.empty
+        g
+      }
+      if gains.nonEmpty then
+        for (id, gain) <- gains do volumeFilters.get(id).foreach(f => Player.applyGain(f, gain))
+
       val target = seekTo
       if target >= 0 then
         // A scrub: seek here (all MLT stays on this thread) and refresh the preview to the target
         // even while paused. No audio is pushed while scrubbing.
         seekTo = -1
         rewindTo(target)
-        renderOneFrame(paced = false)
+        renderOneFrame()
       else if !playing then Thread.sleep(15)
       else
         // Resuming after the timeline played out restarts from the beginning.
@@ -211,7 +258,7 @@ final class Player(
           log.debug("restarting from the beginning", category = "player")
           rewindTo(0)
 
-        if !renderOneFrame(paced = true) then
+        if !pumpPlayback() then
           // End of timeline: stop and let the UI flip its control to Play. The audio device is left
           // running so the last buffered samples drain rather than cut off.
           log.debug(s"reached end of timeline at pos $pos; stopping", category = "player")
@@ -220,9 +267,16 @@ final class Player(
           UiThread.post { () => onEnded() }
     log.debug("decode thread exited", category = "player")
 
-  /** Seek the graph to `frame`, restore play speed, flush the stale audio, and reset the audio
-    * clock. Decode-thread only — every MLT call in the player lives here. */
+  /** Drop every decoded-but-unshown frame (closing each) — the queued frames are stale after a seek or a
+    * graph swap. Decode-thread only. */
+  private def flushQueue(): Unit =
+    while displayQueue.nonEmpty do displayQueue.dequeue().frame.close()
+    reachedEnd = false
+
+  /** Seek the graph to `frame`, restore play speed, drop the buffered frames, flush the stale audio, and
+    * reset the audio clock. Decode-thread only — every MLT call in the player lives here. */
   private def rewindTo(frame: Int): Unit =
+    flushQueue()
     graph.seek(frame)
     graph.speed = 1.0
     consumer.purge()
@@ -241,18 +295,33 @@ final class Player(
 
     consumer.connect(pending.graph) // attach the consumer to the new graph first
     val oldClose = closeGraph
-    graph      = pending.graph
-    closeGraph = pending.close
+    graph         = pending.graph
+    volumeFilters = pending.volumeFilters // the fresh graph's filters become the live gain handles
+    closeGraph    = pending.close
     oldClose() // now nothing points at the old graph, so free it
 
     // Restore the position and repaint that frame at once, so an edit lands whether playing or paused.
     rewindTo(savedPos)
-    renderOneFrame(paced = false)
+    renderOneFrame()
 
-  /** Pull, decode, and present one frame. When `paced`, push the frame's audio and hold the picture
-    * until that audio is due (or fall back to the frame duration for a silent timeline); when not (a
-    * scrub refresh), show the picture at once with no audio. Returns false at end of stream. */
-  private def renderOneFrame(paced: Boolean): Boolean =
+  /** Upload a decoded frame's planes to the video texture on the UI thread, wait for the upload to
+    * finish (the borrowed planes must outlive it), then close the frame. Decode-thread only. */
+  private def uploadFrame(frame: Frame): Unit =
+    val planes = frame.imagePlanes()
+    val y      = planes.planes(0)
+    val u      = planes.planes(1)
+    val v      = planes.planes(2)
+    val uploaded = new CountDownLatch(1)
+    UiThread.post { () =>
+      texture.update(y.data, y.stride, u.data, u.stride, v.data, v.stride)
+      uploaded.countDown()
+    }
+    while !uploaded.await(200, TimeUnit.MILLISECONDS) && !stopping do ()
+    frame.close()
+
+  /** Pull one frame and show it immediately, with no audio — a scrub or post-swap refresh. Returns
+    * false at end of stream. */
+  private def renderOneFrame(): Boolean =
     consumer.rtFrame() match
       case None =>
         Thread.sleep(15) // MLT produced nothing at all; caller will loop
@@ -262,42 +331,54 @@ final class Player(
           frame.close()
           false
         else
-          val planes = frame.imagePlanes()
-          val y      = planes.planes(0)
-          val u      = planes.planes(1)
-          val v      = planes.planes(2)
           pos = frame.position
-          if traceN % 30 == 0 then
-            log.trace(s"frame pos=$pos ${planes.width}x${planes.height} ${planes.format.name}", category = "player")
-          traceN += 1
+          uploadFrame(frame)
+          true
 
-          // Audio + sync. Push this frame's samples, then wait until the device has played up to
-          // where they begin, so the picture below appears in step with the sound. The wait breaks
-          // on pause/seek/stop so the transport stays responsive.
-          if paced then
-            val a = frame.audio(fps, AudioRate, AudioChannels)
+  /** One turn of playback. The decoder runs ahead to keep `AudioLeadSamples` buffered at the device, then
+    * every decoded frame whose audio has reached the speakers is shown. Audio is the clock: the picture
+    * follows it, and the buffered reserve absorbs a GC pause or a heavy render frame that would otherwise
+    * starve the device and click. Returns false once the timeline has ended and every buffered frame has
+    * been shown. Decode-thread only. */
+  private def pumpPlayback(): Boolean =
+    // Fill: decode ahead until the reserve is deep enough (or the queue cap, the end, or an interruption).
+    var filling = true
+    while filling && !reachedEnd && !stopping && playing && seekTo < 0 &&
+      displayQueue.size < MaxBufferedFrames && (pushedSamples - audioPlayed()) < AudioLeadSamples do
+      consumer.rtFrame() match
+        case None => filling = false // MLT produced nothing right now; stop filling this pass
+        case Some(f) =>
+          if f.speed == 0 then
+            f.close()
+            reachedEnd = true // end of timeline; drain what is queued, then stop
+          else
+            val a           = f.audio(fps, AudioRate, AudioChannels)
+            val startSample = pushedSamples
             if a.samples > 0 then
               if !hasAudio then
                 log.info(s"audio: ${a.frequency}Hz ${a.channels}ch, ${a.samples} samples/frame", category = "player")
               hasAudio = true
-              val frameStart = pushedSamples
               audio.put(a.buffer, a.samples * AudioBytesPerSample)
               pushedSamples += a.samples
-              while !stopping && playing && seekTo < 0 && audioPlayed() < frameStart do Thread.sleep(2)
+            displayQueue.enqueue(PendingFrame(f, startSample))
 
-          // Hand the borrowed planes to the UI thread for the GPU upload, then block until it has
-          // read them; the frame must not be closed while the upload is still reading it.
-          val uploaded = new CountDownLatch(1)
-          UiThread.post { () =>
-            texture.update(y.data, y.stride, u.data, u.stride, v.data, v.stride)
-            uploaded.countDown()
-          }
-          while !uploaded.await(200, TimeUnit.MILLISECONDS) && !stopping do ()
-          frame.close()
+    // Show: with audio, every frame whose sound has started playing; silent, one frame paced by its
+    // duration (there is no clock to follow).
+    if hasAudio then
+      while displayQueue.nonEmpty && seekTo < 0 && !stopping && audioPlayed() >= displayQueue.head.startSample do
+        val pf = displayQueue.dequeue()
+        pos = pf.frame.position
+        uploadFrame(pf.frame)
+      Thread.sleep(2)
+    else if displayQueue.nonEmpty then
+      val pf = displayQueue.dequeue()
+      pos = pf.frame.position
+      uploadFrame(pf.frame)
+      Thread.sleep(frameMillis)
+    else Thread.sleep(2)
 
-          // A timeline with no audio has no clock, so pace the picture by the frame duration.
-          if paced && !hasAudio then Thread.sleep(frameMillis)
-          true
+    // Truly done only once the end was reached and every buffered frame has been shown.
+    !(reachedEnd && displayQueue.isEmpty)
 
   /** Samples (per channel) the audio device has actually played since the last rewind: everything
     * pushed, less what is still queued ahead of the device. This is the master clock. */
@@ -313,9 +394,10 @@ object Player:
   /** What `buildGraph` produces: the tractor to play or export, the timeline length in frames, and a
     * teardown that frees every piece in order. */
   private final case class BuildResult(
-      tractor: Tractor,
-      length:  Int,
-      close:   () => Unit,
+      tractor:       Tractor,
+      length:        Int,
+      volumeFilters: Map[String, Filter], // an audio track's `volume` filter, keyed by track id, for live gain
+      close:         () => Unit,
   )
 
   /** Open `project` against a 720p30 graph and build a paused player, the video texture that shows it,
@@ -385,9 +467,20 @@ object Player:
         waveCache(clip.path) = w
 
     val player =
-      new Player(profile, built.tractor, consumer, texture, audio, thumbCache.toMap, waveCache.toMap, built.close)
+      new Player(profile, built.tractor, consumer, texture, audio, thumbCache.toMap, waveCache.toMap,
+        built.volumeFilters, built.close)
     player.setVolume(project.master) // the project's master fader drives the audio device gain
     (player, texture)
+
+  /** Set an audio track's `volume` filter to a linear `gain`, the way kdenlive's mixer does: at unity the
+    * filter is disabled (bypassed — MLT's volume filter is not bit-transparent even at 0 dB, so running it
+    * as a no-op pulses steady content); otherwise it is enabled and its `level` set in dB. Used both when
+    * building the graph and when riding a fader live between frames. */
+  private[kutter] def applyGain(vol: Filter, gain: Double): Unit =
+    if gain == 1.0 then vol.setInt("disable", 1)
+    else
+      vol.setInt("disable", 0)
+      vol.set("level", Mixer.levelDb(gain).toString)
 
   /** Build the multitrack graph for `project`, and return the tractor to play, the timeline length,
     * and a teardown that closes every piece in order.
@@ -423,6 +516,9 @@ object Player:
     val filters   = ListBuffer.empty[Filter]
     val cardProds = ListBuffer.empty[Producer]
 
+    // The audio tracks' volume filters, keyed by track id, so the player can ride each track's gain live.
+    val volFilters = scala.collection.mutable.Map.empty[String, Filter]
+
     // Track 0: the black base every layer folds onto. It is otherwise unbounded, so its out-point
     // bounds it to the timeline.
     val black = Producer(profile, "color:black")
@@ -456,11 +552,21 @@ object Player:
           clipProds += prod
           cursor = pc.timelineEnd
         }
-      if track.gain != 1.0 then
+      // Every audio track carries a `volume` filter so the mixer has a live handle to ride its gain
+      // without rebuilding the graph (see `setTrackGain`); video tracks are silent, so none.
+      //
+      // The gain is driven the way kdenlive's mixer does it: the modern `level` property (in dB), and —
+      // crucially — the filter is **disabled at unity**. MLT's normalize-based volume filter is not
+      // bit-transparent even at 0 dB (its per-frame processing pulses steady content), so at unity the
+      // filter is bypassed outright (`disable = 1`) rather than run as a no-op; a fader move re-enables it
+      // live. The limiter (default -6dBFS) is pushed out of the way so an enabled filter is a clean gain.
+      if track.kind == MediaKind.Audio then
         val vol = Filter(profile, "volume")
-        vol.set("gain", track.gain.toString)
+        vol.set("limiter", "60dBFS")
+        applyGain(vol, track.gain)
         pl.attach(vol)
         filters += vol
+        volFilters(track.id) = vol
       pl
 
     // Layers above the base, each on its own track. `comp`/`mix` are collected and planted after every
@@ -544,7 +650,29 @@ object Player:
       baseTrack.close()
     }
 
-    BuildResult(tractor, length, closeGraph)
+    BuildResult(tractor, length, volFilters.toMap, closeGraph)
+
+  /** Render `project`'s audio through the real playback graph to a WAV at `out` — the exact samples the
+    * decode thread would feed the audio device, captured to a file for offline analysis. Runs the graph
+    * to its end with a non-realtime avformat consumer (float PCM, 48kHz stereo), so a steady tone in the
+    * source comes out as whatever the tractor's mix actually produces. A debug tool, not a playback path. */
+  def renderAudio(project: Project, out: String): Unit =
+    val profile  = Profile(ProfileName)
+    val built    = buildGraph(profile, project)
+    val consumer = Consumer(profile, "avformat", Some(out))
+    consumer.realTime        = 0    // process as fast as possible, drop nothing
+    consumer.terminateOnPause = true // stop when the timeline ends (base track's speed hits 0)
+    consumer.set("acodec", "pcm_f32le") // lossless float PCM so the envelope is exact
+    consumer.set("frequency", AudioRate.toString)
+    consumer.set("channels", AudioChannels.toString)
+    consumer.set("vn", "1")             // audio only
+    consumer.connect(built.tractor)
+    consumer.start()
+    while !consumer.isStopped do Thread.sleep(20)
+    consumer.stop()
+    consumer.close()
+    built.close()
+    profile.close()
 
   /** The length in frames a clip at `path` runs to, against the playback profile — what a full-length
     * placement of a freshly imported clip is sized to. Creates a producer, so it must run on the main
