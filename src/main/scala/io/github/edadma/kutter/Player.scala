@@ -48,18 +48,27 @@ final class Player(
     consumer: Consumer,
     texture:  VideoTexture,
     audio:    AudioStream,
-    val mediaLanes:   Seq[Player.MediaLane],
+    thumbCache: Map[String, Thumbnails],
+    waveCache:  Map[String, Waveform],
     initialCloseGraph: () => Unit,
 ):
   private val log = LoggerFactory.getLogger
 
   // The graph the consumer pulls and the teardown that frees it. They are vars, not constructor vals,
-  // because editing a lower third rebuilds the graph in place (see `update` / `swapGraph`): the decode
-  // thread swaps in a freshly compiled tractor and frees the old one. Only the decode thread touches
-  // them after construction. The media lanes, by contrast, are fixed for a player's life — changing
-  // what is on the tracks re-opens the player, since each lane owns a background generator.
+  // because editing the timeline (a lower third, a clip's position) rebuilds the graph in place (see
+  // `update` / `swapGraph`): the decode thread swaps in a freshly compiled tractor and frees the old
+  // one. Only the decode thread touches them after construction. The generator caches, by contrast, are
+  // fixed for a player's life — importing or removing a source re-opens the player, since each generator
+  // owns a background thread; moving a clip does not, so its generators carry over the live swap.
   private var graph:        Producer   = initialGraph
   private var closeGraph:   () => Unit = initialCloseGraph
+
+  /** The filmstrip generator for the video source at `path`, or null when none was opened for it — the
+    * timeline looks a clip block's strip up by source, so several placements of one clip share it. */
+  def thumbsFor(path: String): Thumbnails | Null = thumbCache.getOrElse(path, null)
+
+  /** The waveform generator for the audio source at `path`, or null when none was opened for it. */
+  def waveFor(path: String): Waveform | Null = waveCache.getOrElse(path, null)
 
   // The flags the UI thread and the decode thread share. The UI thread sets `playing` (play/pause)
   // and `stopping` (teardown) and `seekTo` (scrub); the decode thread reads them and owns every MLT
@@ -165,14 +174,8 @@ final class Player(
     thread match
       case t: Thread => t.join()
       case null      => ()
-    mediaLanes.foreach { lane =>
-      lane.thumbs match
-        case t: Thumbnails => t.close()
-        case null          => ()
-      lane.waveform match
-        case w: Waveform => w.close()
-        case null        => ()
-    }
+    thumbCache.values.foreach(_.close())
+    waveCache.values.foreach(_.close())
     audio.pause()
     audio.destroy()
     consumer.stop()
@@ -307,17 +310,6 @@ object Player:
   // the lower thirds don't reach further — 10 seconds, matching the UI's empty-timeline default.
   private val DefaultLength = 300
 
-  /** One track's presence on the timeline: its kind, its label, the frame its content reaches, and the
-    * background generator that fills its lane — a filmstrip for a video track, a waveform for an audio
-    * track. Fixed for a player's lifetime; changing what is on the tracks re-opens the player. */
-  final case class MediaLane(
-      kind:     MediaKind,
-      name:     String,
-      length:   Int,
-      thumbs:   Thumbnails | Null = null,
-      waveform: Waveform | Null   = null,
-  )
-
   /** What `buildGraph` produces: the tractor to play or export, the timeline length in frames, and a
     * teardown that frees every piece in order. */
   private final case class BuildResult(
@@ -368,34 +360,29 @@ object Player:
       category = "player",
     )
 
-    // One timeline lane per project track, each with a background generator on its own graph and thread
-    // so none touches the playback decode thread: a filmstrip for a video track, a waveform for an audio
-    // track, taken from the track's first clip. An empty track contributes an empty lane (no generator),
-    // so V1/A1 read as lanes waiting for clips. They fill in shortly after the window appears; the
-    // timeline reads them as they are made.
-    val lanes = project.tracks.map { track =>
-      val firstPath = track.ordered.headOption.flatMap(pc => project.clipFor(pc.clipId)).map(_.path)
-      val len       = math.max(1, track.contentEnd)
-      track.kind match
-        case MediaKind.Video =>
-          val thumbs = firstPath match
-            case Some(p) =>
-              val t = new Thumbnails(ThumbCount, ThumbWidth, ThumbHeight)
-              t.start(ProfileName, p)
-              t
-            case None => null
-          MediaLane(MediaKind.Video, track.name, track.contentEnd, thumbs = thumbs)
-        case MediaKind.Audio =>
-          val wave = firstPath match
-            case Some(p) =>
-              val w = new Waveform(len)
-              w.start(ProfileName, p, profile.fps)
-              w
-            case None => null
-          MediaLane(MediaKind.Audio, track.name, track.contentEnd, waveform = wave)
-    }
+    // A background generator per source clip, each on its own graph and thread so none touches the
+    // playback decode thread: a filmstrip for every video source placed on a video track, a waveform for
+    // every audio source placed on an audio track. Keyed by source path, so several placements of the
+    // same clip share one generator; the timeline looks a clip block's strip or envelope up by source.
+    // A source that is a linked A/V pair gets both — a filmstrip for its picture on V1 and a waveform for
+    // its sound on A1. Generators fill in shortly after the window appears; the timeline reads them as
+    // they are made.
+    val thumbCache = scala.collection.mutable.LinkedHashMap.empty[String, Thumbnails]
+    for track <- project.videoTracks; pc <- track.ordered; clip <- project.clipFor(pc.clipId) do
+      if !thumbCache.contains(clip.path) then
+        val t = new Thumbnails(ThumbCount, ThumbWidth, ThumbHeight)
+        t.start(ProfileName, clip.path)
+        thumbCache(clip.path) = t
 
-    val player = new Player(profile, built.tractor, consumer, texture, audio, lanes, built.close)
+    val waveCache = scala.collection.mutable.LinkedHashMap.empty[String, Waveform]
+    for track <- project.audioTracks; pc <- track.ordered; clip <- project.clipFor(pc.clipId) do
+      if !waveCache.contains(clip.path) then
+        val w = new Waveform(math.max(1, pc.length))
+        w.start(ProfileName, clip.path, profile.fps)
+        waveCache(clip.path) = w
+
+    val player =
+      new Player(profile, built.tractor, consumer, texture, audio, thumbCache.toMap, waveCache.toMap, built.close)
     player.setVolume(project.master) // the project's master fader drives the audio device gain
     (player, texture)
 

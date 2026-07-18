@@ -26,16 +26,30 @@ object Timeline:
       selected: Boolean,
   )
 
-  /** One track: a named lane and what rides on it. A media track spans a single clip of `lengthFrames`
-    * frames from the start of the timeline and carries either a filmstrip (`thumbs`, a video clip) or a
-    * waveform overview (`waveform`, an audio clip); the titles lane carries a set of lower-third
+  /** One placed clip's block on a media lane: where it sits on the timeline (`start` for `length`
+    * frames), a caption, whether it is one half of a linked A/V pair, whether it is the selected clip,
+    * and the generator that fills it — a filmstrip (`thumbs`, on a video track) or a waveform overview
+    * (`waveform`, on an audio track). A block carries whichever one its track draws. The generator is
+    * keyed by source, so several placements of the same clip share one; the block's geometry is the
+    * live placement, so a clip drawn here always sits where the project puts it. */
+  case class ClipBlock(
+      id:       String,
+      start:    Int,
+      length:   Int,
+      label:    String,
+      linked:   Boolean,
+      selected: Boolean,
+      thumbs:   Thumbnails | Null = null,
+      waveform: Waveform | Null   = null,
+  )
+
+  /** One track: a named lane and what rides on it. A media track sequences its placed `clips` at their
+    * timeline positions (each a filmstrip or a waveform); the titles lane carries a set of lower-third
     * `overlays` instead. A track sets whichever one it draws. */
   case class Track(
-      name:         String,
-      lengthFrames: Int,
-      thumbs:       Thumbnails | Null        = null,
-      waveform:     Waveform | Null          = null,
-      overlays:     Seq[OverlayBlock] | Null = null,
+      name:     String,
+      clips:    Seq[ClipBlock]          = Nil,
+      overlays: Seq[OverlayBlock] | Null = null,
   )
 
   /** The frame-count-to-x mapping for a widget `width` wide holding `total` frames. */
@@ -60,6 +74,21 @@ object Timeline:
     blocks.reverseIterator
       .find(b => px >= xOf(b.inFrame, total, width) && px <= xOf(b.outFrame, total, width))
       .map(_.id)
+
+  /** The id of the clip block under widget-local x `px`, if any — how a press on a media lane picks a
+    * placed clip to select or drag. Clips on a track never overlap, so the first hit wins. */
+  def clipAt(px: Double, total: Int, width: Double, blocks: Seq[ClipBlock]): Option[String] =
+    blocks.find(b => px >= xOf(b.start, total, width) && px <= xOf(b.start + b.length, total, width)).map(_.id)
+
+  /** The lowest and highest timeline start a clip of `length` at `origStart` may take while staying in
+    * its current gap between neighbours (given as (start, length) pairs, excluding this clip) and within
+    * `[0, total)`. Confining a dragged clip to its gap keeps a track's clips a non-overlapping sequence,
+    * which is what the graph's per-track playlist requires. */
+  def clipStartBounds(origStart: Int, length: Int, total: Int, others: Seq[(Int, Int)]): (Int, Int) =
+    val origEnd   = origStart + length
+    val prevEnd   = others.collect { case (s, l) if s + l <= origStart => s + l }.maxOption.getOrElse(0)
+    val nextStart = others.collect { case (s, _) if s >= origEnd => s }.minOption.getOrElse(total)
+    (math.max(0, prevEnd), math.max(0, math.min(total, nextStart) - length))
 
   private def playheadInk(theme: Theme): Color = theme.accent
 
@@ -97,8 +126,10 @@ object Timeline:
     cv.fillRect(Rect(px - 0.5, 8, 1.5, size.height - 8), head)
     cv.fillPath(Path.polyline(Seq(Offset(px - 5, 0), Offset(px + 5, 0), Offset(px, 8))), head)
 
-  /** Paint one track widget: its clip blocks (a filmstrip where the strip is ready, flat otherwise),
-    * each with a bright top cap, a border, and the clip's name — and the playhead line over them. */
+  /** Paint one track widget: each of its placed clips as a block at its timeline position — a filmstrip
+    * where the strip is ready and a waveform for an audio clip, flat otherwise — with a bright top cap,
+    * a border (ringed when selected), a link pip on a linked half, and the clip's name; then the
+    * playhead line over them all. */
   def paintTrack(cv: Canvas, size: Size, track: Track, total: Int, position: Int, theme: Theme): Unit =
     val w  = size.width
     val h  = size.height
@@ -118,20 +149,21 @@ object Timeline:
       cv.fillRect(Rect(hx - 0.5, 0, 1.5, h), playheadInk(theme))
       return
 
-    val audioBg  = if theme.isDark then Color.rgb(0x24303a) else Color.rgb(0xd4e2ee)
-    val waveInk  = if theme.isDark then Color.rgb(0x74c0fc) else Color.rgb(0x3b7bb8)
+    val audioBg = if theme.isDark then Color.rgb(0x24303a) else Color.rgb(0xd4e2ee)
+    val waveInk = if theme.isDark then Color.rgb(0x74c0fc) else Color.rgb(0x3b7bb8)
 
-    // A media lane draws a single block spanning its clip, from the start of the timeline to its length.
-    if track.lengthFrames > 0 then
-      val x1   = 0.0
-      val x2   = xOf(track.lengthFrames, total, w)
+    // Each placed clip is a block from its start for its length. Blocks never overlap, so they paint
+    // independently, left to right along the lane.
+    for b <- track.clips do
+      val x1   = xOf(b.start, total, w)
+      val x2   = xOf(b.start + b.length, total, w)
       val bw   = math.max(2.0, x2 - x1 - 2)
       val span = math.max(1.0, x2 - x1)
       val r    = Rect(x1 + 1, 2, bw, bh)
 
-      track.waveform match
+      b.waveform match
         case wf: Waveform =>
-          // An audio lane: the peak envelope mirrored around the block's midline.
+          // An audio clip: the peak envelope mirrored around the block's midline.
           cv.fillRoundedRect(r, radius, audioBg)
           cv.pushClip(r, radius)
           val mid   = 2 + bh / 2
@@ -143,11 +175,10 @@ object Timeline:
             if hh > 0.3 then cv.fillRect(Rect(sx, mid - hh, 1.3, hh * 2), waveInk)
             sx += 1.6
           cv.popClip()
-          cv.strokeRoundedRect(r, radius, theme.border, 1.0)
 
         case null =>
-          // A video lane: a filmstrip where the strip is ready, flat otherwise, with a bright cap.
-          track.thumbs match
+          // A video clip: a filmstrip where the strip is ready, flat otherwise, with a bright cap.
+          b.thumbs match
             case t: Thumbnails =>
               cv.fillRoundedRect(r, radius, blockCol)
               cv.pushClip(r, radius)
@@ -162,7 +193,22 @@ object Timeline:
             case null =>
               cv.fillRoundedRect(r, radius, blockCol)
           cv.fillRoundedRect(Rect(x1 + 1, 2, bw, 4), BorderRadius.all(2), blockTop)
-          cv.strokeRoundedRect(r, radius, theme.border, 1.0)
+
+      // The clip's name, over a soft scrim so it reads on either a filmstrip or a waveform.
+      val label = b.label
+      val ls    = TextStyle(11.0, Color.white)
+      val lw    = cv.measureText(label, ls).width
+      if bw > 24 then
+        cv.pushClip(r, radius)
+        cv.fillRect(Rect(x1 + 1, 2, math.min(bw, lw + 12), 16), Color(0, 0, 0, 115))
+        cv.drawText(Offset(x1 + 7, 4), label, ls)
+        cv.popClip()
+
+      // A link pip marks a clip that moves with its A/V partner (the picture and its sound stay locked).
+      if b.linked then cv.fillRoundedRect(Rect(x2 - 9, 4, 5, 5), BorderRadius.all(2.5), theme.accent)
+
+      if b.selected then cv.strokeRoundedRect(r, radius, theme.primary, 2.0)
+      else cv.strokeRoundedRect(r, radius, theme.border, 1.0)
 
     val px = xOf(position, total, w)
     cv.fillRect(Rect(px - 0.5, 0, 1.5, h), playheadInk(theme))

@@ -56,6 +56,10 @@ private val App: Component[Session] = component[Session] { initial =>
   // bin panel. `None` when nothing is selected (the inspector then shows its hint).
   val (selectedId, setSelectedId, _) = useState[Option[String]](None)
 
+  // Which placed clip is selected on the timeline, by its placement id — ringed on its lane and shown
+  // in the inspector. A clip and a lower third are never selected at once; picking one clears the other.
+  val (selectedClipId, setSelectedClipId, _) = useState[Option[String]](None)
+
   // The pending confirmation, if any — a destructive action (remove a clip, clear the project) held
   // until the user confirms it in the dialog.
   val (confirm, setConfirm, _) = useState[Option[ConfirmSpec]](None)
@@ -95,6 +99,19 @@ private val App: Component[Session] = component[Session] { initial =>
   val dragIn     = useRef(0)
   val dragLen    = useRef(0)
   val dragLastIn = useRef(0)
+
+  // Dragging a placed clip along its track. On grab we remember the clip (`cdragId`), the frame the
+  // cursor grabbed at (`cdragGrab`), and the move group — the dragged clip plus, when it is one half of
+  // a linked A/V pair, its partner on the other track — as (placement id, original start) pairs
+  // (`cdragGroup`), so the whole group shifts by one delta and stays locked. `cdragLo`/`cdragHi` bound
+  // that delta to what every member's track can accommodate without overlapping a neighbour; `cdragLast`
+  // skips a redundant edit when the delta hasn't changed. `cdragId == null` means no clip drag.
+  val cdragId    = useRef[String | Null](null)
+  val cdragGrab  = useRef(0)
+  val cdragGroup = useRef[List[(String, Int)]](Nil)
+  val cdragLo    = useRef(0)
+  val cdragHi    = useRef(0)
+  val cdragLast  = useRef(0)
 
   // Poll the player's position to drive the scrubber — but not while scrubbing, when the drag owns
   // the position and a poll would fight the cursor.
@@ -199,21 +216,19 @@ private val App: Component[Session] = component[Session] { initial =>
         setPlaying(p.isPlaying)
       case null => ()
 
-  // The timeline's length and frame rate. With a project open they are the player's. Before then the
-  // project still has a working timeline — long enough to lay out lower thirds ahead of footage, and
-  // never shorter than the overlays already reach — so a title can be authored, positioned, and
-  // previewed-in-place before a video is placed. The rate is the fixed playback profile's 30fps.
-  val (total, fps) = playerRef.current match
-    case p: Player => (p.totalFrames, p.fps)
-    case null      => (math.max(DefaultTimelineFrames, project.lowerThirds.map(_.outFrame + 1).maxOption.getOrElse(0)), 30.0)
-  val progress = math.min(1.0, frame.toDouble / total)
+  // The frame the project's content reaches — the furthest clip or lower third — which the timeline
+  // must be at least as long as so a clip dragged toward the end still has room and the ruler covers it.
+  val projectExtent = math.max(project.contentEnd, project.lowerThirds.map(_.outFrame + 1).maxOption.getOrElse(0))
 
-  // The timeline lanes, one per project track, read straight off the player. Empty until it opens.
-  // Their generators fill in on their own threads; the position poll re-renders often enough that
-  // they appear as they are made.
-  val mediaLanes = playerRef.current match
-    case p: Player => p.mediaLanes
-    case null      => Nil
+  // The timeline's length and frame rate. With a project open the length is the player's graph length,
+  // grown to cover any edit made since it opened (a clip moved past the old end) so the ruler and the
+  // drag bounds keep up before the next re-open refreshes it. Before a player opens, the project still
+  // has a working timeline — long enough to lay out lower thirds ahead of footage — so a title can be
+  // authored, positioned, and previewed-in-place before a video is placed. The rate is the profile's.
+  val (total, fps) = playerRef.current match
+    case p: Player => (math.max(p.totalFrames, projectExtent), p.fps)
+    case null      => (math.max(DefaultTimelineFrames, projectExtent), 30.0)
+  val progress = math.min(1.0, frame.toDouble / total)
 
   // Seek the displayed position to `fraction` of the timeline immediately (so the thumb tracks with no
   // decode round-trip) and ask the player to render that frame.
@@ -255,6 +270,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // the move is relative to the grab.
   def beginOverlayDrag(id: String, grabFrame: Int): Unit =
     setSelectedId(Some(id))
+    setSelectedClipId(None)
     project.lowerThirds.find(_.id == id).foreach { lt =>
       dragId.current     = id
       dragGrab.current   = grabFrame
@@ -277,6 +293,72 @@ private val App: Component[Session] = component[Session] { initial =>
 
   // End a title drag.
   def endOverlayDrag(): Unit = dragId.current = null
+
+  // Select a placed clip for the inspector, clearing any lower-third selection (the two are exclusive).
+  def selectClip(id: String): Unit =
+    setSelectedClipId(Some(id))
+    setSelectedId(None)
+
+  // The clips that move together with the placement `id`: itself, and — when it is one half of a linked
+  // A/V pair — every placement sharing its link id, across tracks. Each returned with the track it is on,
+  // so a move can respect that track's neighbours. An unlinked clip moves alone.
+  def moveGroupOf(p: Project, id: String): List[(String, PlacedClip)] =
+    val target = p.tracks.flatMap(t => t.clips.find(_.id == id).map(c => (t.id, c))).headOption
+    target match
+      case Some((_, pc)) =>
+        pc.link match
+          case Some(lnk) => p.tracks.flatMap(t => t.clips.filter(_.link.contains(lnk)).map(c => (t.id, c)))
+          case None      => target.toList
+      case None => Nil
+
+  // Begin dragging the clip `id`, grabbed at `grabFrame`: select it, resolve its move group (the pair,
+  // when linked), snapshot each member's start, and compute how far the group may slide in either
+  // direction — the tightest bound across every member, so a linked pair never lets one half overlap a
+  // neighbour while the other moves. A press that doesn't move stays a plain selection.
+  def beginClipDrag(id: String, grabFrame: Int): Unit =
+    selectClip(id)
+    val group = moveGroupOf(project, id)
+    if group.nonEmpty then
+      val ids = group.map(_._2.id).toSet
+      var lo  = Int.MinValue
+      var hi  = Int.MaxValue
+      for (trackId, pc) <- group do
+        val others = project.tracks.find(_.id == trackId).toList
+          .flatMap(_.clips).filterNot(c => ids.contains(c.id)).map(c => (c.timelineStart, c.length))
+        val (blo, bhi) = Timeline.clipStartBounds(pc.timelineStart, pc.length, total, others)
+        lo = math.max(lo, blo - pc.timelineStart)
+        hi = math.min(hi, bhi - pc.timelineStart)
+      cdragId.current    = id
+      cdragGrab.current  = grabFrame
+      cdragGroup.current = group.map { case (_, pc) => (pc.id, pc.timelineStart) }
+      cdragLo.current    = lo
+      cdragHi.current    = hi
+      cdragLast.current  = 0
+
+  // Continue a clip drag: shift the whole group by the cursor's travel from the grab, clamped to the
+  // group's feasible delta, and move every member together. Only edits when the delta changes, so a
+  // press that doesn't move drives no rebuild.
+  def dragClip(curFrame: Int): Unit =
+    cdragId.current match
+      case _: String =>
+        val want  = curFrame - cdragGrab.current
+        val delta = math.max(cdragLo.current, math.min(cdragHi.current, want))
+        if delta != cdragLast.current then
+          cdragLast.current = delta
+          val starts = cdragGroup.current.toMap
+          editProject(p =>
+            p.copy(tracks = p.tracks.map(t =>
+              t.copy(clips = t.clips.map(c =>
+                starts.get(c.id) match
+                  case Some(orig) => c.copy(timelineStart = orig + delta)
+                  case None       => c,
+              )),
+            )),
+          )
+      case null => ()
+
+  // End a clip drag.
+  def endClipDrag(): Unit = cdragId.current = null
 
   // The scrubber is suit's Slider: grabbing it pauses and holds on the frame (remembering whether to
   // resume), dragging seeks, and releasing resumes if it was playing. The Slider owns the pointer
@@ -370,6 +452,7 @@ private val App: Component[Session] = component[Session] { initial =>
     val lt    = LowerThird(id, "Name", "Title", start, start + len)
     editProject(p => p.copy(lowerThirds = p.lowerThirds :+ lt))
     setSelectedId(Some(id))
+    setSelectedClipId(None)
 
   // Remove a lower third, clearing the selection if it was the one removed.
   def removeLowerThird(id: String): Unit =
@@ -515,6 +598,16 @@ private val App: Component[Session] = component[Session] { initial =>
     )
     reopen(p, path)
 
+  // Remove a placed clip from the timeline, taking its linked partner with it (a locked pair leaves as
+  // one), and keeping the source in the bin so it can be placed again. Changing what is on the tracks
+  // changes the lanes' generators, so this re-opens the player.
+  def removePlacement(id: String): Unit =
+    dirty.current = true
+    val group = moveGroupOf(project, id).map(_._2.id).toSet
+    val p     = project.copy(tracks = project.tracks.map(t => t.copy(clips = t.clips.filterNot(c => group.contains(c.id)))))
+    setSelectedClipId(None)
+    reopen(p, path)
+
   // The media on the timeline as a comparable key — each track's kind and its placements (source path,
   // in-point, length, start) in order — so opening a project with the same media reuses the live
   // graph-swap and a different arrangement re-opens.
@@ -585,7 +678,7 @@ private val App: Component[Session] = component[Session] { initial =>
   def ltRow(lt: LowerThird): VNode =
     val selected = selectedId.contains(lt.id)
     row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-      box(onClick = _ => setSelectedId(Some(lt.id)), cursor = Cursor.Pointer, flex = 1, radius = 6,
+      box(onClick = _ => { setSelectedId(Some(lt.id)); setSelectedClipId(None) }, cursor = Cursor.Pointer, flex = 1, radius = 6,
         bg = if selected then theme.primary else theme.background,
         padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
         col(mainAxisSize = MainAxisSize.Min, spacing = 1)(
@@ -713,12 +806,34 @@ private val App: Component[Session] = component[Session] { initial =>
       ),
     )
 
-  // The inspector (right): the selected lower third's editor, or a hint when nothing is selected.
+  // The inspector body for the selected clip: its source, its timeline position and length, whether it
+  // is a linked A/V half, and a way to take it off the timeline. Position and length are read-only here;
+  // trimming and unlinking come with the timeline's edge handles.
+  def clipInspectorBody(pc: PlacedClip, clip: MediaClip): VNode =
+    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 12)(
+      labeled("Clip")(text(clip.name, size = 13, color = theme.surfaceText, maxLines = 1)),
+      row(crossAxisAlignment = CrossAxisAlignment.Start, spacing = 8)(
+        box(flex = 1)(labeled("Start")(text(timecode(pc.timelineStart, fps), size = 13, color = theme.surfaceText, mono = true))),
+        box(flex = 1)(labeled("Length")(text(timecode(pc.length, fps), size = 13, color = theme.surfaceText, mono = true))),
+      ),
+      if pc.link.isDefined then text("Linked A/V — picture and sound move together.", size = 11, color = theme.accent, maxLines = 0)
+      else text("Unlinked.", size = 11, color = theme.border),
+      textButton("Remove from timeline", () => removePlacement(pc.id)),
+    )
+
+  // The inspector (right): the selected clip's details, else the selected lower third's editor, else a
+  // hint. A clip and a lower third are never selected at once, so at most one editor shows.
+  val selectedClip =
+    selectedClipId.flatMap(id =>
+      project.tracks.flatMap(_.clips).find(_.id == id).flatMap(pc => project.clipFor(pc.clipId).map((pc, _))))
   val selectedLt     = selectedId.flatMap(id => project.lowerThirds.find(_.id == id))
   val inspectorPanel = titledPanel("Inspector")(
-    selectedLt match
-      case Some(lt) => inspectorBody(lt)
-      case None     => placeholder("Select a lower third"),
+    selectedClip match
+      case Some((pc, clip)) => clipInspectorBody(pc, clip)
+      case None =>
+        selectedLt match
+          case Some(lt) => inspectorBody(lt)
+          case None     => placeholder("Select a clip or lower third"),
   )
 
   // The lane colour for a lower third, drawn from its style so a block on the timeline reads as the
@@ -743,19 +858,39 @@ private val App: Component[Session] = component[Session] { initial =>
     ),
   )
 
-  // The tracks, drawn top-to-bottom: one lane per project track (a video track's filmstrip, an audio
-  // track's waveform), then the titles lane the lower thirds ride on. When no player is open the empty
-  // project tracks (V1, A1) still show as lanes waiting for clips, as in any editor. The titles lane is
-  // always present so it is a stable target as overlays are added.
-  val mediaTracks =
-    if mediaLanes.nonEmpty then
-      mediaLanes.map { lane =>
-        lane.kind match
-          case MediaKind.Video => Timeline.Track(lane.name, lane.length, thumbs = lane.thumbs)
-          case MediaKind.Audio => Timeline.Track(lane.name, lane.length, waveform = lane.waveform)
+  // A project track's placed clips as timeline blocks. The geometry — where each block sits and how long
+  // it is — is the live project, so a clip is drawn where it is placed and follows a drag at once; its
+  // filmstrip or waveform is looked up from the player by source, so several placements of one clip share
+  // a generator and an empty track simply draws no blocks. With no player open the blocks draw flat (no
+  // generators yet) but still show at their positions.
+  def blocksFor(t: Track): Seq[Timeline.ClipBlock] =
+    t.ordered.flatMap { pc =>
+      project.clipFor(pc.clipId).map { clip =>
+        val (thumbs, wave) = playerRef.current match
+          case p: Player =>
+            t.kind match
+              case MediaKind.Video => (p.thumbsFor(clip.path), null)
+              case MediaKind.Audio => (null, p.waveFor(clip.path))
+          case null => (null, null)
+        Timeline.ClipBlock(
+          id       = pc.id,
+          start    = pc.timelineStart,
+          length   = pc.length,
+          label    = clip.name,
+          linked   = pc.link.isDefined,
+          selected = selectedClipId.contains(pc.id),
+          thumbs   = thumbs,
+          waveform = wave,
+        )
       }
-    else project.tracks.map(t => Timeline.Track(t.name, 0))
-  val tracks = mediaTracks :+ Timeline.Track("Titles", 0, overlays = overlayBlocks)
+    }
+
+  // The tracks, drawn top-to-bottom: one lane per project track (a video track's filmstrips, an audio
+  // track's waveforms), then the titles lane the lower thirds ride on. The empty default tracks (V1, A1)
+  // still show as lanes waiting for clips, as in any editor. The titles lane is always present so it is a
+  // stable target as overlays are added.
+  val mediaTracks = project.tracks.map(t => Timeline.Track(t.name, blocksFor(t)))
+  val tracks      = mediaTracks :+ Timeline.Track("Titles", overlays = overlayBlocks)
 
   // Scrubbing works from the ruler or any track: mousedown begins, drag seeks (the canvas captures
   // the pointer so it tracks past the widget's edges), release ends. All widgets share the timeline
@@ -797,7 +932,22 @@ private val App: Component[Session] = component[Session] { initial =>
     val lane =
       t.overlays match
         case null =>
-          scrubCanvas(paint)
+          // A media lane: a press on a clip selects it and begins a move (a linked pair moves together);
+          // a press on the empty part of the lane scrubs.
+          canvas(
+            onMouseDown = e =>
+              val f = Timeline.frameAt(e.localX, total, e.size.width)
+              Timeline.clipAt(e.localX, total, e.size.width, t.clips) match
+                case Some(id) => beginClipDrag(id, f)
+                case None     => beginScrub(f),
+            onMouseMove = e =>
+              val f = Timeline.frameAt(e.localX, total, e.size.width)
+              if cdragId.current != null then dragClip(f)
+              else if scrubbing.current then scrubTo(f),
+            onMouseUp = _ =>
+              endClipDrag()
+              endScrub(),
+          )(paint)
         case blocks =>
           canvas(
             onMouseDown = e =>

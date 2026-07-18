@@ -93,10 +93,11 @@ private[kutter] object Diagnostics:
         return true
       case None => ()
 
-    // `KUTTER_PROBE_HIT` checks the timeline's pure click-mapping — `frameAt` (cursor x → frame) and
-    // `overlayAt` (cursor x → the lower third under it) — without a window, since selecting a title
-    // block on the timeline hangs off exactly these. It prints PASS/FAIL per case and exits non-zero on
-    // any failure, so it doubles as a regression guard runnable off the GUI.
+    // `KUTTER_PROBE_HIT` checks the timeline's pure click-mapping and drag math — `frameAt` (cursor x →
+    // frame), `overlayAt`/`clipAt` (cursor x → the lower third or clip under it), `dragPlacement` (a
+    // title's new window), and `clipStartBounds` (how far a placed clip may slide within its gap) —
+    // without a window, since selecting and moving a block on the timeline hang off exactly these. It
+    // prints PASS/FAIL per case and exits non-zero on any failure, a regression guard runnable off the GUI.
     if sys.env.contains("KUTTER_PROBE_HIT") then
       val total = 600
       val width = 600.0 // a 1:1 frame-to-pixel mapping keeps the expected values obvious
@@ -121,6 +122,20 @@ private[kutter] object Diagnostics:
       check("drag left", Timeline.dragPlacement(45, 120, 100, 60, total), 5)     // -40
       check("drag clamp-left", Timeline.dragPlacement(45, 120, 100, 0, total), 0)
       check("drag clamp-right", Timeline.dragPlacement(45, 120, 100, 9999, total), total - 1 - 120)
+
+      // clipAt: two clips sequenced on a lane — [0,100) and [150,250). A press inside one picks it; a
+      // press in the gap between them picks neither. This is how a press on a media lane selects a clip.
+      val cb0 = Timeline.ClipBlock("c0", 0, 100, "0", false, false)
+      val cb1 = Timeline.ClipBlock("c1", 150, 100, "1", false, false)
+      check("clipAt on 0", Timeline.clipAt(50.0, total, width, Seq(cb0, cb1)), Some("c0"))
+      check("clipAt on 1", Timeline.clipAt(200.0, total, width, Seq(cb0, cb1)), Some("c1"))
+      check("clipAt gap", Timeline.clipAt(125.0, total, width, Seq(cb0, cb1)), None)
+
+      // clipStartBounds: a clip of length 50 at start 100 between neighbours [0,80) and [200,260) may
+      // slide only within its gap — no earlier than the previous end (80), no later than the next start
+      // less its length (200-50=150). With no neighbours it ranges the whole timeline up to total-length.
+      check("clip bounds gap", Timeline.clipStartBounds(100, 50, total, Seq((0, 80), (200, 60))), (80, 150))
+      check("clip bounds free", Timeline.clipStartBounds(100, 50, total, Nil), (0, total - 50))
 
       // Batch import: the time parser (timecodes / seconds) and one whole HOCON list.
       check("time m:ss", BatchImport.parseTime("1:12"), Right(72.0))
