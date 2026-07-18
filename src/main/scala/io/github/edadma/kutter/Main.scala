@@ -38,6 +38,13 @@ private val TimelineTailFrames = 300
 // state drives every destructive prompt (remove a clip, clear the project), rather than a flag each.
 private final case class ConfirmSpec(title: String, message: String, confirmLabel: String, action: () => Unit)
 
+// Which monitor the centre panel shows, and which player the transport drives. The project monitor plays
+// the assembled timeline; the clip monitor previews a single bin clip in isolation (as in kdenlive). Only
+// one is engaged at a time — switching to the clip monitor pauses the project player and opens a light
+// one-clip player; switching back closes it — so at most one player voices audio.
+private enum MonitorMode:
+  case Project, Clip
+
 /** Format a frame count as m:ss.cc (hundredths of a second) at the given frame rate, for the
   * transport's time readout. */
 private def timecode(frames: Int, fps: Double): String =
@@ -66,6 +73,11 @@ private val App: Component[Session] = component[Session] { initial =>
   // in the inspector. A clip and a lower third are never selected at once; picking one clears the other.
   val (selectedClipId, setSelectedClipId, _) = useState[Option[String]](None)
 
+  // Which monitor the centre panel shows, and which bin clip (if any) the clip monitor previews. The
+  // clip monitor is engaged by picking a bin clip; the Project tab returns to the timeline.
+  val (monitorMode, setMonitorMode, _) = useState[MonitorMode](MonitorMode.Project)
+  val (selectedBinId, setSelectedBinId, _) = useState[Option[String]](None)
+
   // The pending confirmation, if any — a destructive action (remove a clip, clear the project) held
   // until the user confirms it in the dialog.
   val (confirm, setConfirm, _) = useState[Option[ConfirmSpec]](None)
@@ -89,6 +101,24 @@ private val App: Component[Session] = component[Session] { initial =>
   // media) can destroy the old one and install the new. The unmount cleanup tears down whatever these
   // refs hold, not the pair captured at mount, so a mid-session swap is safe.
   val textureRef = useRef[VideoTexture | Null](null)
+
+  // The clip monitor's player and texture — a light, one-clip player opened when a bin clip is picked for
+  // preview, and closed when the project monitor is shown again, so only one player is ever engaged.
+  // `clipPlayerId` records which bin clip it currently shows, so re-selecting the same clip doesn't
+  // needlessly reopen it. `clipLayer`/`clipFrame`/`clipTotal` mirror the project monitor's `layer`/`frame`
+  // /`total` for the clip preview and its own scrubber.
+  val clipPlayerRef  = useRef[Player | Null](null)
+  val clipTextureRef = useRef[VideoTexture | Null](null)
+  val clipPlayerId   = useRef[String | Null](null)
+  val (clipLayer, setClipLayer, _) = useState[VideoLayer | Null](null)
+  val (clipFrame, setClipFrame, _) = useState(0)
+  val (clipTotal, setClipTotal, _) = useState(0)
+
+  // Whether the clip monitor is showing, and the player the transport currently drives. Everything the
+  // transport does (play/pause, scrub, seek, position) goes through this indirection so one transport
+  // serves both monitors; the timeline always drives the project player.
+  val isClip = monitorMode == MonitorMode.Clip
+  def activePlayer(): Player | Null = if isClip then clipPlayerRef.current else playerRef.current
 
   // Scrubbing state. While the pointer is held on the bar, playback is paused and the position
   // follows the cursor; `wasPlaying` remembers whether to resume on release. Refs, not state,
@@ -140,6 +170,9 @@ private val App: Component[Session] = component[Session] { initial =>
       if !scrubbing.current then
         playerRef.current match
           case p: Player => setFrame(p.position)
+          case null      => ()
+        clipPlayerRef.current match
+          case p: Player => setClipFrame(p.position)
           case null      => (),
     100,
   )
@@ -163,6 +196,75 @@ private val App: Component[Session] = component[Session] { initial =>
     player.seek(0) // paused on the first frame; the user presses play when ready
     setLayer(texture)
 
+  // A one-clip project for the clip monitor: a video clip previews as its linked A/V pair (picture over
+  // its own sound), an audio clip on an audio track alone (the preview is black, the sound plays).
+  def clipMonitorProject(clip: MediaClip): Project =
+    val len = math.max(1, if clip.frames > 0 then clip.frames else Player.mediaLength(clip.path))
+    clip.kind match
+      case MediaKind.Video => Diagnostics.videoProject(clip.path, len)
+      case MediaKind.Audio =>
+        Project.blank.copy(
+          bin = List(clip),
+          tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len)))),
+        )
+
+  // Tear down the clip monitor's player and texture and drop its refs. Safe to call when none is open.
+  def closeClipPlayer(): Unit =
+    clipPlayerRef.current match
+      case p: Player => p.close()
+      case null      => ()
+    clipTextureRef.current match
+      case t: VideoTexture => t.destroy()
+      case null            => ()
+    clipPlayerRef.current  = null
+    clipTextureRef.current = null
+    clipPlayerId.current   = null
+    setClipLayer(null)
+
+  // Open the clip monitor on `clip`, paused on its first frame, at the current master volume. Replaces
+  // any clip player already open. Runs on the UI thread (MLT producer creation must stay on the main
+  // thread), so it is only ever called from a handler.
+  def openClipPlayer(clip: MediaClip): Unit =
+    closeClipPlayer()
+    val (player, texture) = Player.open(clipMonitorProject(clip))
+    player.onEnded        = () => setPlaying(false)
+    clipPlayerRef.current  = player
+    clipTextureRef.current = texture
+    clipPlayerId.current   = clip.id
+    player.start()
+    player.setVolume(volume)
+    player.seek(0)
+    setClipLayer(texture)
+    setClipFrame(0)
+    setClipTotal(player.totalFrames)
+
+  // Show the clip monitor for a bin clip: select it, pause the project player, open the clip player (only
+  // reopening when a different clip is picked), and switch the centre panel to the clip tab.
+  def showClipMonitor(clip: MediaClip): Unit =
+    setSelectedBinId(Some(clip.id))
+    playerRef.current match
+      case p: Player => p.pause()
+      case null      => ()
+    if clipPlayerRef.current == null || clipPlayerId.current != clip.id then openClipPlayer(clip)
+    setMonitorMode(MonitorMode.Clip)
+    setPlaying(false)
+
+  // Return to the project monitor: close the clip player (so only the project player remains and voices
+  // audio), switch the centre panel back, restore the master volume display, and reflect the project
+  // player's play state (it is paused, having been paused when the clip monitor took over).
+  def showProjectMonitor(): Unit =
+    closeClipPlayer()
+    setMonitorMode(MonitorMode.Project)
+    setVolume(project.master)
+    playerRef.current match
+      case p: Player => setPlaying(p.isPlaying)
+      case null      => setPlaying(false)
+
+  // Pull focus to the project monitor when the timeline is touched while the clip monitor is showing — a
+  // timeline gesture is inherently a project action, so it takes the centre panel back (kdenlive-style).
+  def focusProjectMonitor(): Unit =
+    if isClip then showProjectMonitor()
+
   useEffect(
     () =>
       if hasContent(initial.project) then openPlayerFor(initial.project)
@@ -174,6 +276,7 @@ private val App: Component[Session] = component[Session] { initial =>
         textureRef.current match
           case t: VideoTexture => t.destroy()
           case null            => ()
+        closeClipPlayer()
     ,
     Array(),
   )
@@ -230,7 +333,7 @@ private val App: Component[Session] = component[Session] { initial =>
     editProject(p => p.copy(lowerThirds = p.lowerThirds.map(lt => if lt.id == id then f(lt) else lt)))
 
   def toggle(): Unit =
-    playerRef.current match
+    activePlayer() match
       case p: Player =>
         if p.isPlaying then p.pause() else p.play()
         setPlaying(p.isPlaying)
@@ -255,20 +358,27 @@ private val App: Component[Session] = component[Session] { initial =>
   // graph itself is only sized to the content (the black base ends at `contentReach`), so the tail is
   // purely timeline headroom, not rendered frames.
   val total    = contentReach + math.max(TimelineTailFrames, contentReach / 2)
-  val progress = math.min(1.0, frame.toDouble / total)
 
-  // Seek the displayed position to `fraction` of the timeline immediately (so the thumb tracks with no
-  // decode round-trip) and ask the player to render that frame.
+  // What the transport shows and drives: the active monitor's position, length, and played fraction. In
+  // the project monitor these are the timeline's; in the clip monitor they are the previewed clip's own.
+  val activeFrame    = if isClip then clipFrame else frame
+  val activeTotal    = if isClip then clipTotal else total
+  val activeProgress = if activeTotal > 0 then math.min(1.0, activeFrame.toDouble / activeTotal) else 0.0
+
+  // Seek the active monitor to `fraction` of its length immediately (so the thumb tracks with no decode
+  // round-trip) and ask its player to render that frame.
   def seekToFraction(fraction: Double): Unit =
-    val f = math.round(fraction * total).toInt
-    setFrame(f)
-    playerRef.current match
+    val f = math.round(fraction * activeTotal).toInt
+    if isClip then setClipFrame(f) else setFrame(f)
+    activePlayer() match
       case p: Player => p.seek(f)
       case null      => ()
 
   // Begin a scrub (from the timeline): pause and hold, remembering whether to resume, and jump to
-  // `frame`. Shares the drag state with the transport scrubber's brackets.
+  // `frame`. Shares the drag state with the transport scrubber's brackets. Touching the timeline pulls
+  // focus back to the project monitor if the clip monitor was showing.
   def beginScrub(frame: Int): Unit =
+    focusProjectMonitor()
     playerRef.current match
       case p: Player =>
         scrubbing.current  = true
@@ -296,6 +406,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // Begin dragging the title block `id`, grabbed at `grabFrame`: select it and snapshot its window so
   // the move is relative to the grab.
   def beginOverlayDrag(id: String, grabFrame: Int): Unit =
+    focusProjectMonitor()
     setSelectedId(Some(id))
     setSelectedClipId(None)
     project.lowerThirds.find(_.id == id).foreach { lt =>
@@ -343,6 +454,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // direction — the tightest bound across every member, so a linked pair never lets one half overlap a
   // neighbour while the other moves. A press that doesn't move stays a plain selection.
   def beginClipDrag(id: String, grabFrame: Int): Unit =
+    focusProjectMonitor()
     selectClip(id)
     val group = moveGroupOf(project, id)
     if group.nonEmpty then
@@ -403,6 +515,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // tightest bound across every member, so a linked pair trims together without either half running off
   // the source or over a neighbour.
   def beginTrim(id: String, edge: Timeline.TrimEdge, grabFrame: Int): Unit =
+    focusProjectMonitor()
     selectClip(id)
     val group = moveGroupOf(project, id)
     if group.nonEmpty then
@@ -472,10 +585,10 @@ private val App: Component[Session] = component[Session] { initial =>
   // capture, direct cursor tracking, and the played-progress fill; kutter only supplies the playback
   // behaviour through the drag brackets.
   val scrubber = Slider(
-    value    = progress,
+    value    = activeProgress,
     onChange = seekToFraction,
     onChangeStart = _ =>
-      playerRef.current match
+      activePlayer() match
         case p: Player =>
           scrubbing.current  = true
           wasPlaying.current = p.isPlaying
@@ -484,7 +597,7 @@ private val App: Component[Session] = component[Session] { initial =>
     onChangeEnd = _ =>
       scrubbing.current = false
       if wasPlaying.current then
-        playerRef.current match
+        activePlayer() match
           case p: Player => p.play()
           case null      => (),
   )
@@ -498,14 +611,21 @@ private val App: Component[Session] = component[Session] { initial =>
       radius  = 8,
     )(svg(icon, width = 22, height = 22))
 
-  // Master volume: drive both the displayed level and the player's audio gain, and persist it on the
-  // project so a reopen restores it (the project's master fader).
+  // Master volume: drive the displayed level and the active monitor's audio gain. In the project monitor
+  // it is the project master and persists (so a reopen restores it); in the clip monitor it only rides the
+  // preview's gain, leaving the project master untouched.
   def onVolume(v: Double): Unit =
     setVolume(v)
-    playerRef.current match
+    activePlayer() match
       case p: Player => p.setVolume(v)
       case null      => ()
-    editProject(_.copy(master = v))
+    if !isClip then editProject(_.copy(master = v))
+
+  // What the transport names on its right: the previewed clip in the clip monitor, else the project's
+  // first clip (or its name) in the project monitor.
+  val transportLabel =
+    if isClip then selectedBinId.flatMap(id => project.bin.find(_.id == id)).map(_.name).getOrElse("Clip")
+    else project.bin.headOption.map(_.name).getOrElse(project.name)
 
   // The transport: the scrubber over a row of play / timecode / frame index / name / master volume.
   val transport =
@@ -514,10 +634,10 @@ private val App: Component[Session] = component[Session] { initial =>
         scrubber,
         row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 12)(
           iconButton(if playing then pauseIcon else playIcon, () => toggle()),
-          text(s"${timecode(frame, fps)} / ${timecode(total, fps)}", size = 14, color = theme.surfaceText, mono = true),
-          text(s"frame $frame / $total", size = 12, color = theme.border, mono = true),
+          text(s"${timecode(activeFrame, fps)} / ${timecode(activeTotal, fps)}", size = 14, color = theme.surfaceText, mono = true),
+          text(s"frame $activeFrame / $activeTotal", size = 12, color = theme.border, mono = true),
           spacer(),
-          text(project.bin.headOption.map(_.name).getOrElse(project.name), size = 13, color = theme.surfaceText),
+          text(transportLabel, size = 13, color = theme.surfaceText),
           svg(volumeIcon, width = 18, height = 18),
           sizedBox(width = 90)(Slider(volume, onVolume)),
         ),
@@ -579,6 +699,9 @@ private val App: Component[Session] = component[Session] { initial =>
     textureRef.current = null
     setLayer(null)
     edited.current = false
+    closeClipPlayer()
+    setMonitorMode(MonitorMode.Project)
+    setSelectedBinId(None)
 
   // Clear to a new empty project: empty bin, empty default tracks, no lower thirds, unbound. The full
   // reset behind "New".
@@ -699,6 +822,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // black), re-open on it; otherwise tear the player down to the empty preview.
   def removeBinClip(id: String): Unit =
     dirty.current = true
+    if selectedBinId.contains(id) then showProjectMonitor()
     val p = project.copy(
       bin = project.bin.filterNot(_.id == id),
       tracks = project.tracks.map(t => t.copy(clips = t.clips.filterNot(_.clipId == id))),
@@ -839,12 +963,18 @@ private val App: Component[Session] = component[Session] { initial =>
     )
 
   // One bin row: a kind icon, the file name, and a remove button that confirms first (removing a source
-  // takes its placements off the timeline with it). The lower thirds are kept — footage and overlays are
-  // independent.
+  // takes its placements off the timeline with it). Clicking the name previews the clip in the clip
+  // monitor (the selected clip's row fills with the primary colour); the Place button drops it on the
+  // timeline. The lower thirds are kept — footage and overlays are independent.
   def binClipRow(clip: MediaClip): VNode =
+    val selected = selectedBinId.contains(clip.id)
     row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
       svg(if clip.kind == MediaKind.Audio then volumeIcon else playIcon, width = 16, height = 16),
-      box(flex = 1)(text(clip.name, size = 13, color = theme.surfaceText, maxLines = 1)),
+      box(onClick = _ => showClipMonitor(clip), cursor = Cursor.Pointer, flex = 1, radius = 6,
+        bg = if selected then theme.primary else Color.transparent,
+        padding = EdgeInsets.symmetric(horizontal = 6, vertical = 4))(
+        text(clip.name, size = 13, color = if selected then theme.onPrimary else theme.surfaceText, maxLines = 1),
+      ),
       textButton("Place", () => placeAtPlayhead(clip)),
       box(onClick = _ => setConfirm(Some(ConfirmSpec(
         "Remove clip?",
@@ -898,26 +1028,57 @@ private val App: Component[Session] = component[Session] { initial =>
     ),
   )
 
-  // The video preview — the top of the player panel. With a project it shows the picture; with one
-  // opening, a brief notice. With nothing it is just black: the bin is where media is imported, so the
-  // preview needs no prompt of its own.
-  val preview =
-    box(bg = Color.black, flex = 1)(
-      layer match
-        case l: VideoLayer => video(l, fit = VideoFit.Contain)
-        case null if hasContent(project) =>
-          box(flex = 1)(
-            col(mainAxisAlignment = MainAxisAlignment.Center, crossAxisAlignment = CrossAxisAlignment.Center)(
-              text("Opening…", size = 16, color = theme.surfaceText),
-            ),
-          )
-        case null => box(flex = 1)(),
+  // A centred hint shown over the black preview when there is no picture to show.
+  def previewHint(msg: String): VNode =
+    box(flex = 1)(
+      col(mainAxisAlignment = MainAxisAlignment.Center, crossAxisAlignment = CrossAxisAlignment.Center)(
+        text(msg, size = 16, color = theme.surfaceText),
+      ),
     )
 
-  // The player panel (centre): the preview and its transport, grouped as one card.
+  // The video preview — the top of the player panel. In the project monitor it shows the assembled
+  // timeline (a notice while opening, black before any media is imported); in the clip monitor it shows
+  // the previewed bin clip (a prompt when none is picked). The bin is where media is imported, so the
+  // project preview needs no prompt of its own.
+  val preview =
+    box(bg = Color.black, flex = 1)(
+      if isClip then
+        clipLayer match
+          case l: VideoLayer => video(l, fit = VideoFit.Contain)
+          case null          => previewHint("Select a clip in the bin")
+      else
+        layer match
+          case l: VideoLayer                => video(l, fit = VideoFit.Contain)
+          case null if hasContent(project)  => previewHint("Opening…")
+          case null                         => box(flex = 1)(),
+    )
+
+  // One monitor tab in the player panel's header: a rounded label that reads as pressed when it is the
+  // shown monitor.
+  def monitorTab(label: String, active: Boolean, onClick: () => Unit): VNode =
+    box(onClick = _ => onClick(), cursor = Cursor.Pointer, bg = if active then theme.surface else theme.background,
+      radius = 6, padding = EdgeInsets.symmetric(horizontal = 14, vertical = 6))(
+      text(label, size = 12, weight = FontWeight.Bold, color = if active then theme.surfaceText else theme.border),
+    )
+
+  // The clip/project monitor switcher across the top of the player panel. The Clip tab reopens the clip
+  // monitor on the selected bin clip (or shows its prompt when none is selected); Project returns to the
+  // timeline.
+  val monitorTabs =
+    box(bg = theme.background, padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
+      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
+        monitorTab("Clip", isClip, () =>
+          selectedBinId.flatMap(id => project.bin.find(_.id == id)) match
+            case Some(clip) => showClipMonitor(clip)
+            case None       => setMonitorMode(MonitorMode.Clip)),
+        monitorTab("Project", !isClip, () => showProjectMonitor()),
+      ),
+    )
+
+  // The player panel (centre): the monitor tabs over the preview and its transport, grouped as one card.
   val playerPanel =
     panel(flexN = 1)(
-      col(crossAxisAlignment = CrossAxisAlignment.Stretch)(preview, transport),
+      col(crossAxisAlignment = CrossAxisAlignment.Stretch)(monitorTabs, preview, transport),
     )
 
   // A labelled inspector control: a small caption over the field.
