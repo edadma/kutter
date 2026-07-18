@@ -238,6 +238,16 @@ private[kutter] object Diagnostics:
       check("track content end", seqTrack.contentEnd, 200)
       check("track gain muted", Track("a", "A", MediaKind.Audio, Nil, 0.8, muted = true).gain, 0.0)
 
+      // The mixer's dB math: a linear fader gain converts to decibels for the readout — unity is 0 dB,
+      // half amplitude about −6 dB, double about +6 dB, and silence −∞ (no finite dB). Feeding a muted
+      // track's effective gain (0) here is what makes a muted fader read −∞.
+      check("gainToDb unity", Mixer.gainToDb(1.0), 0.0)
+      check("gainToDb silence", Mixer.gainToDb(0.0), Double.NegativeInfinity)
+      check("dbLabel unity", Mixer.dbLabel(1.0), "0.0 dB")
+      check("dbLabel silence", Mixer.dbLabel(0.0), "-∞ dB")
+      check("dbLabel half", Mixer.dbLabel(0.5), "-6.0 dB")
+      check("dbLabel double", Mixer.dbLabel(2.0), "+6.0 dB")
+
       // Re-import replaces: lower thirds tagged with a source file are swapped out (not appended to) when
       // that same file is imported again; overlays from other files or added by hand are untouched.
       val existing = List(

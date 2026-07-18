@@ -580,6 +580,17 @@ private val App: Component[Session] = component[Session] { initial =>
     editProject(p => p.copy(tracks = p.tracks.map(t =>
       t.copy(clips = t.clips.map(c => if group.contains(c.id) then c.copy(link = None) else c)))))
 
+  // Set an audio track's fader to the linear gain `v` (0 silent, 1 unity). A volume change leaves the
+  // tracks' clips untouched — only the per-track `volume` filter's gain differs — so it rides the live
+  // graph-swap (`editProject`→effect→`p.update`), like a lower-third edit, with no re-open.
+  def setTrackVolume(id: String, v: Double): Unit =
+    editProject(_.updateTrack(id)(_.copy(volume = v)))
+
+  // Toggle an audio track's mute. `Track.gain` is 0 while muted (the fader value is remembered and
+  // returns on unmute), and buildGraph reads `gain`, so this too rides the live graph-swap.
+  def toggleMute(id: String): Unit =
+    editProject(_.updateTrack(id)(t => t.copy(muted = !t.muted)))
+
   // The scrubber is suit's Slider: grabbing it pauses and holds on the frame (remembering whether to
   // resume), dragging seeks, and releasing resumes if it was playing. The Slider owns the pointer
   // capture, direct cursor tracking, and the played-progress fill; kutter only supplies the playback
@@ -1147,6 +1158,45 @@ private val App: Component[Session] = component[Session] { initial =>
           case None     => placeholder("Select a clip or lower third"),
   )
 
+  // A track's mute toggle: a small "M" that fills with the primary colour while the track is silenced,
+  // matching the app's "active reads as primary" idiom.
+  def muteButton(t: Track): VNode =
+    box(onClick = _ => toggleMute(t.id), cursor = Cursor.Pointer, radius = 6,
+      bg = if t.muted then theme.primary else theme.background,
+      padding = EdgeInsets.symmetric(horizontal = 10, vertical = 6))(
+      text("M", size = 12, weight = FontWeight.Bold, color = if t.muted then theme.onPrimary else theme.border),
+    )
+
+  // One channel strip in the mixer: the track's name, its fader (a horizontal Slider over the linear
+  // gain), the dB readout of its effective gain (−∞ while muted), and the mute toggle. The fader edits
+  // `Track.volume` live, so the change is heard on the next graph swap without a re-open.
+  def faderRow(t: Track): VNode =
+    row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
+      sizedBox(width = 28)(text(t.name, size = 11, weight = FontWeight.Bold, color = theme.border)),
+      box(flex = 1)(Slider(t.volume, v => setTrackVolume(t.id, v))),
+      sizedBox(width = 58)(text(Mixer.dbLabel(t.gain), size = 11, color = theme.surfaceText, mono = true)),
+      muteButton(t),
+    )
+
+  // The audio mixer (a pane in the right column): a channel strip per audio track over a master strip.
+  // The master strip is the transport's volume control mirrored here — same value, same handler — so the
+  // two stay in lockstep; it drives the audio-device gain (`Player.setVolume`), not a graph filter.
+  val mixerPanel = titledPanel("Audio Mixer")(
+    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 12)(
+      if project.audioTracks.isEmpty then placeholder("No audio tracks")
+      else col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 10)(
+        project.audioTracks.map(faderRow)*,
+      ),
+      box(height = 1, bg = theme.border)(),
+      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
+        sizedBox(width = 28)(text("Mix", size = 11, weight = FontWeight.Bold, color = theme.surfaceText)),
+        box(flex = 1)(Slider(volume, onVolume)),
+        sizedBox(width = 58)(text(Mixer.dbLabel(volume), size = 11, color = theme.surfaceText, mono = true)),
+        sizedBox(width = 34)(box()()),
+      ),
+    ),
+  )
+
   // The lane colour for a lower third, drawn from its style so a block on the timeline reads as the
   // look it wears: the accent stripe if the style has one, else the bar if it is solid enough, else
   // the theme accent (for a bar-less style like "minimal", whose card is all text).
@@ -1314,7 +1364,11 @@ private val App: Component[Session] = component[Session] { initial =>
       binPanel,
       splitter(axis = Axis.Horizontal, initial = 0.74, min = 0.5, max = 0.86)(
         playerPanel,
-        inspectorPanel,
+        // The right column stacks the inspector over the audio mixer, split by a draggable gutter.
+        splitter(axis = Axis.Vertical, initial = 0.58, min = 0.3, max = 0.8)(
+          inspectorPanel,
+          mixerPanel,
+        ),
       ),
     )
 
