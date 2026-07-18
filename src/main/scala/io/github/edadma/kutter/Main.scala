@@ -348,14 +348,18 @@ private val App: Component[Session] = component[Session] { initial =>
       cdragHi.current    = hi
       cdragLast.current  = 0
 
-  // Continue a clip drag: shift the whole group by the cursor's travel from the grab, clamped to the
-  // group's feasible delta, and move every member together. Only edits when the delta changes, so a
-  // press that doesn't move drives no rebuild.
+  // Continue a clip drag: shift the whole group by the cursor's travel from the grab, snapped so the
+  // dragged clip's start lands on a half-second boundary (so a fixed-length title fits exactly before
+  // it), clamped to the group's feasible delta, and move every member together. Only edits when the
+  // delta changes, so a press that doesn't move drives no rebuild.
   def dragClip(curFrame: Int): Unit =
     cdragId.current match
-      case _: String =>
+      case id: String =>
         val want  = curFrame - cdragGrab.current
-        val delta = math.max(cdragLo.current, math.min(cdragHi.current, want))
+        val snap  = math.max(1, math.round(fps / 2).toInt) // frames in a half second
+        val orig  = cdragGroup.current.find(_._1 == id).map(_._2).getOrElse(0)
+        val snapped = math.round((orig + want).toDouble / snap).toInt * snap - orig
+        val delta = math.max(cdragLo.current, math.min(cdragHi.current, snapped))
         if delta != cdragLast.current then
           cdragLast.current = delta
           val starts = cdragGroup.current.toMap
