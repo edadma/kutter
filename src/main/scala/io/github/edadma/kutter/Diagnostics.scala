@@ -19,15 +19,17 @@ private[kutter] object Diagnostics:
   // for the probes without opening a producer to measure it (which would need MLT initialised first).
   private val DemoLength = 600
 
-  /** A project holding a single video clip on V1 (with an empty A1), for the probes and helpers that
-    * want a project built around one source. The placement runs `len` frames from the clip's head. */
+  /** A project holding a single video clip as a linked A/V pair — its picture on V1 and its audio on
+    * A1, sharing a link id — for the probes and helpers that want a project built around one source.
+    * Both placements run `len` frames from the clip's head. */
   def videoProject(path: String, len: Int = DemoLength): Project =
     val clip = MediaClip.make(path, MediaKind.Video)
+    val link = Some("demo-link")
     Project.blank.copy(
       bin = List(clip),
       tracks = List(
-        Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(clip.id, 0, len))),
-        Track("a1", "A1", MediaKind.Audio),
+        Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(clip.id, 0, len, link = link))),
+        Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len, link = link))),
       ),
     )
 
@@ -173,6 +175,12 @@ private[kutter] object Diagnostics:
       check("video project bin", vp.bin.map(_.path), List("clip.mp4"))
       check("video project placed", vp.videoTracks.head.clips.map(_.length), List(120))
       check("video project hasMedia", vp.hasMedia, true)
+      // The video is a linked A/V pair: its audio is placed on A1 with the same window and link id as
+      // the picture on V1, so A1 shows the video's peaks and the two move together.
+      check("video project audio linked", vp.audioTracks.head.clips.map(_.length), List(120))
+      check("video project link shared",
+        vp.videoTracks.head.clips.head.link == vp.audioTracks.head.clips.head.link && vp.videoTracks.head.clips.head.link.isDefined,
+        true)
       val sess = Session(
         vp.copy(lowerThirds = List(LowerThird("x", "Name", "Title", 0, 60))),
         Some("/path/proj.kutter"),

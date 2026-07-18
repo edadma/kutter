@@ -187,13 +187,18 @@ object MediaClip:
 
 /** A source clip placed on a track: which bin clip it draws from (`clipId`), where it begins on the
   * timeline (`timelineStart`, in frames), and which slice of the source it plays (`inPoint` for
-  * `length` frames). Several placements can reference the same bin clip; each carries its own window. */
+  * `length` frames). Several placements can reference the same bin clip; each carries its own window.
+  *
+  * `link` groups the two halves of a video-with-sound clip: the picture on a video track and its audio
+  * on an audio track share a link id, so they read as one clip (the audio's peaks sit under the picture
+  * for clapper/audio sync) and move together. Two independent clips have no link. */
 final case class PlacedClip(
     id:            String,
     clipId:        String,
     timelineStart: Int,
     inPoint:       Int,
     length:        Int,
+    link:          Option[String] = None,
 ):
   /** The frame just past this placement's end on the timeline. */
   def timelineEnd: Int = timelineStart + length
@@ -202,8 +207,8 @@ object PlacedClip:
   given JsonCodec[PlacedClip] = DeriveJsonCodec.gen
 
   /** A placement of `clip` at `start`, playing the whole source for `length` frames from its head. */
-  def make(clipId: String, start: Int, length: Int, inPoint: Int = 0): PlacedClip =
-    PlacedClip(s"pc-${System.nanoTime()}", clipId, start, inPoint, length)
+  def make(clipId: String, start: Int, length: Int, inPoint: Int = 0, link: Option[String] = None): PlacedClip =
+    PlacedClip(s"pc-${System.nanoTime()}", clipId, start, inPoint, length, link)
 
 /** A track container: a named lane that always exists and sequences a list of placed clips along the
   * timeline. Video tracks are composited top-down (higher tracks over lower); audio tracks are mixed.

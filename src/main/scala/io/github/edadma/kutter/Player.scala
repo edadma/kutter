@@ -445,9 +445,13 @@ object Player:
 
     // Compile one project track into a playlist: its clips laid out in timeline order with blanks
     // filling the gaps between them, and the track's fader applied as a `volume` filter when it is not
-    // unity (or the track is muted). A clip whose source is missing from the bin is skipped. An audio
-    // track's producers contribute sound only — their video stream is disabled, so an audio file that
-    // also carries a picture does not put that picture on the track.
+    // unity (or the track is muted). A clip whose source is missing from the bin is skipped.
+    //
+    // A track's producers contribute only what the track is for: an **audio** track disables its
+    // producers' video (`video_index = -1`), and a **video** track disables their audio
+    // (`audio_index = -1`). So a video-with-sound clip, placed as a linked pair (picture on a video
+    // track, sound on an audio track), plays its audio exactly once — from the audio track — while the
+    // video track carries the picture. All sound comes from audio tracks; video tracks are silent.
     def compileTrack(track: Track): Playlist =
       val pl     = Playlist(profile)
       var cursor = 0
@@ -456,6 +460,7 @@ object Player:
           if pc.timelineStart > cursor then pl.blank(pc.timelineStart - cursor)
           val prod = Producer(profile, clip.path)
           if track.kind == MediaKind.Audio then prod.setInt("video_index", -1)
+          else prod.setInt("audio_index", -1)
           prod.setInAndOut(pc.inPoint, pc.inPoint + pc.length - 1)
           pl.append(prod)
           clipProds += prod
@@ -486,12 +491,13 @@ object Player:
       t
 
     // Video tracks first (composited, bottom-to-top so a higher track wins), then audio tracks (mixed).
+    // Video tracks are silent (their audio is disabled above), so they carry no mix — only a composite.
     for track <- project.videoTracks do
       val pl    = compileTrack(track)
       val slot  = nextTrack; nextTrack += 1
       playlists += pl
       tractor.setTrack(pl, slot)
-      layers += Layer(slot, composite(), mixer())
+      layers += Layer(slot, composite(), null)
 
     for track <- project.audioTracks do
       val pl    = compileTrack(track)

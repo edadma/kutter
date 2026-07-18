@@ -463,20 +463,33 @@ private val App: Component[Session] = component[Session] { initial =>
   val videoFilter = Seq(FileDialog.Filter("Video", "mp4;mov;m4v;mkv;webm;avi"))
   val audioFilter = Seq(FileDialog.Filter("Audio", "mp3;wav;m4a;aac;flac;ogg"))
 
-  // Import a clip of `kind` into the bin and append it to the end of the first track of that kind, then
-  // re-open the player on it. Placing a clip changes the timeline lanes (each owns a background
-  // generator), so this rebuilds the player from scratch rather than the live graph-swap the lower-third
-  // edits use. The clip's length is measured against the profile (a producer, so on the UI/main thread).
-  // Stage 1 appends; dragging a bin clip to an arbitrary track position comes with the timeline UI.
+  // Append `clip` to the end of `track` (a placement `len` frames long at the track's content end),
+  // returning the updated project. Used to build up a track by importing clips.
+  def appendTo(p: Project, trackId: String, clip: MediaClip, len: Int, link: Option[String]): Project =
+    p.updateTrack(trackId)(t => t.copy(clips = t.clips :+ PlacedClip.make(clip.id, t.contentEnd, len, link = link)))
+
+  // Import a clip of `kind` into the bin and place it, then re-open the player on it. Placing a clip
+  // changes the timeline lanes (each owns a background generator), so this rebuilds the player from
+  // scratch rather than the live graph-swap the lower-third edits use. The clip's length is measured
+  // against the profile (a producer, so on the UI/main thread).
+  //
+  // A **video** clip is placed as a linked A/V pair — its picture on the first video track and its
+  // audio on the first audio track, sharing a link id and the same window — so A1 shows the video's
+  // peaks under the picture (for clapper/audio sync) and its sound plays from the audio track. An
+  // **audio** clip goes on the first audio track alone. Stage 1 appends; dragging a bin clip to an
+  // arbitrary track position, and unlinking a pair, come with the timeline UI.
   def importClip(pathStr: String, kind: MediaKind): Unit =
     dirty.current = true
-    val len  = Player.mediaLength(pathStr)
-    val clip = MediaClip.make(pathStr, kind)
+    val len      = Player.mediaLength(pathStr)
+    val clip     = MediaClip.make(pathStr, kind)
     val withClip = project.copy(bin = project.bin :+ clip)
-    val placed = project.tracks.find(_.kind == kind) match
-      case Some(track) =>
-        withClip.updateTrack(track.id)(t => t.copy(clips = t.clips :+ PlacedClip.make(clip.id, t.contentEnd, len)))
-      case None => withClip
+    val placed = kind match
+      case MediaKind.Video =>
+        val link = Some(s"lnk-${System.nanoTime()}")
+        val onV  = project.videoTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, link)).getOrElse(withClip)
+        project.audioTracks.headOption.map(t => appendTo(onV, t.id, clip, len, link)).getOrElse(onV)
+      case MediaKind.Audio =>
+        project.audioTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, None)).getOrElse(withClip)
     reopen(placed, path)
 
   def doImportVideo(): Unit =
