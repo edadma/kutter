@@ -173,17 +173,22 @@ object MediaKind:
 
 /** One piece of source media in the project's bin: an imported video or audio file. A bin clip is a
   * source, not a placement — it names a file that can be dropped onto a track (once, or several times)
-  * with its own in/out window each time. */
-final case class MediaClip(id: String, path: String, kind: MediaKind):
+  * with its own in/out window each time. `frames` is the source's length against the playback profile,
+  * measured once at import — a trim needs it to know how far a placement can be extended (a placement's
+  * window can grow up to the source's own length) and to map a trimmed block's filmstrip/waveform back
+  * onto the whole source. It is 0 for a clip from a project saved before trimming existed; callers then
+  * fall back to the placement's own end, so an old project still opens (just not extendable past what it
+  * already shows). */
+final case class MediaClip(id: String, path: String, kind: MediaKind, frames: Int = 0):
   /** The file's basename, for the bin and the clip label. */
   def name: String = path.split('/').lastOption.getOrElse(path)
 
 object MediaClip:
   given JsonCodec[MediaClip] = DeriveJsonCodec.gen
 
-  /** A new bin clip of `kind` for `path`, with a fresh id. */
-  def make(path: String, kind: MediaKind): MediaClip =
-    MediaClip(s"clip-${System.nanoTime()}", path, kind)
+  /** A new bin clip of `kind` for `path`, `frames` long against the profile, with a fresh id. */
+  def make(path: String, kind: MediaKind, frames: Int = 0): MediaClip =
+    MediaClip(s"clip-${System.nanoTime()}", path, kind, frames)
 
 /** A source clip placed on a track: which bin clip it draws from (`clipId`), where it begins on the
   * timeline (`timelineStart`, in frames), and which slice of the source it plays (`inPoint` for

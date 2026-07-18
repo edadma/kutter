@@ -26,12 +26,21 @@ object Timeline:
       selected: Boolean,
   )
 
+  /** Which edge of a clip block a trim drags: the left edge (moving the in-point and the start together)
+    * or the right edge (moving the out-point, i.e. the length). */
+  enum TrimEdge:
+    case Left, Right
+
   /** One placed clip's block on a media lane: where it sits on the timeline (`start` for `length`
-    * frames), a caption, whether it is one half of a linked A/V pair, whether it is the selected clip,
-    * and the generator that fills it — a filmstrip (`thumbs`, on a video track) or a waveform overview
-    * (`waveform`, on an audio track). A block carries whichever one its track draws. The generator is
-    * keyed by source, so several placements of the same clip share one; the block's geometry is the
-    * live placement, so a clip drawn here always sits where the project puts it. */
+    * frames), the slice of the source it plays (`inPoint` into a source `srcLen` frames long), a
+    * caption, whether it is one half of a linked A/V pair, whether it is the selected clip, and the
+    * generator that fills it — a filmstrip (`thumbs`, on a video track) or a waveform overview
+    * (`waveform`, on an audio track). A block carries whichever one its track draws. The generator spans
+    * the whole source and is keyed by source, so several placements of the same clip share one; `inPoint`
+    * and `srcLen` map the block's span back onto that whole-source generator, so a trimmed block shows
+    * exactly the slice it plays. `srcLen` of 0 (a source whose length was never measured) falls back to a
+    * one-to-one block mapping. The block's geometry is the live placement, so a clip drawn here always
+    * sits where the project puts it. */
   case class ClipBlock(
       id:       String,
       start:    Int,
@@ -39,6 +48,8 @@ object Timeline:
       label:    String,
       linked:   Boolean,
       selected: Boolean,
+      inPoint:  Int              = 0,
+      srcLen:   Int              = 0,
       thumbs:   Thumbnails | Null = null,
       waveform: Waveform | Null   = null,
   )
@@ -89,6 +100,47 @@ object Timeline:
     val prevEnd   = others.collect { case (s, l) if s + l <= origStart => s + l }.maxOption.getOrElse(0)
     val nextStart = others.collect { case (s, _) if s >= origEnd => s }.minOption.getOrElse(total)
     (math.max(0, prevEnd), math.max(0, math.min(total, nextStart) - length))
+
+  /** The trim edge under widget-local x `px`, if the cursor is within a few pixels of a block's left or
+    * right edge — how a press on a media lane picks a clip edge to trim rather than the body to move. The
+    * left edge wins over the right when both are near (a very short block), and a hit is preferred to the
+    * whole-body `clipAt` in the caller so the edges stay grabbable. */
+  def clipEdgeAt(px: Double, total: Int, width: Double, blocks: Seq[ClipBlock]): Option[(String, TrimEdge)] =
+    val band = 6.0
+    blocks.iterator.flatMap { b =>
+      val x1 = xOf(b.start, total, width)
+      val x2 = xOf(b.start + b.length, total, width)
+      if math.abs(px - x1) <= band then Some((b.id, TrimEdge.Left))
+      else if math.abs(px - x2) <= band then Some((b.id, TrimEdge.Right))
+      else None
+    }.nextOption()
+
+  /** The range of frame deltas a trim of `edge` may apply, staying on the source and in the clip's gap.
+    * A placement plays `length` frames from `inPoint` into a source `srcLen` frames long, starting at
+    * `start`; `others` are the same-track neighbours (start, length) it must not overlap.
+    *
+    *   - **Right** edge (the out-point): a delta grows (`+`) or shrinks (`-`) the length, kept `>= 1`
+    *     frame, never past the source's end (`inPoint + length <= srcLen`) and never over the next clip.
+    *   - **Left** edge (the in-point): a delta moves the in-point and the start together — `+` trims the
+    *     head (revealing later source, a shorter clip), `-` reveals earlier source — kept so `inPoint`
+    *     stays `>= 0`, the start stays past the previous clip, and the length stays `>= 1`.
+    *
+    * A linked pair intersects the ranges of its halves so both trim by one delta and stay locked. */
+  def clipTrimBounds(
+      edge: TrimEdge, start: Int, inPoint: Int, length: Int, srcLen: Int, total: Int, others: Seq[(Int, Int)],
+  ): (Int, Int) =
+    val end       = start + length
+    val prevEnd   = others.collect { case (s, l) if s + l <= start => s + l }.maxOption.getOrElse(0)
+    val nextStart = others.collect { case (s, _) if s >= end => s }.minOption.getOrElse(total)
+    edge match
+      case TrimEdge.Right =>
+        val lo = 1 - length
+        val hi = math.min(srcLen - inPoint - length, nextStart - end)
+        (lo, hi)
+      case TrimEdge.Left =>
+        val lo = math.max(-inPoint, prevEnd - start)
+        val hi = length - 1
+        (lo, hi)
 
   /** Where a new placement of a clip `srcLen` frames long should land when dropped at `atFrame`, given
     * the existing clips on the two tracks it occupies — `aBlocks` and `bBlocks` as (start, length) pairs
@@ -184,6 +236,12 @@ object Timeline:
       val span = math.max(1.0, x2 - x1)
       val r    = Rect(x1 + 1, 2, bw, bh)
 
+      // A block fraction (0..1 across the block) maps to a fraction of the *whole source* the generators
+      // span, so a trimmed block shows exactly the slice it plays. With no measured source length, fall
+      // back to a one-to-one mapping (the block is the whole source, as before trimming existed).
+      def srcFrac(blockFrac: Double): Double =
+        if b.srcLen > 0 then (b.inPoint + blockFrac * b.length) / b.srcLen else blockFrac
+
       b.waveform match
         case wf: Waveform =>
           // An audio clip: the peak envelope mirrored around the block's midline.
@@ -194,7 +252,7 @@ object Timeline:
           cv.fillRect(Rect(x1 + 1, mid - 0.25, bw, 0.5), waveInk) // centre line
           var sx = x1 + 1
           while sx < x2 - 1 do
-            val hh = wf.at((sx - x1) / span) * halfH
+            val hh = wf.at(srcFrac((sx - x1) / span)) * halfH
             if hh > 0.3 then cv.fillRect(Rect(sx, mid - hh, 1.3, hh * 2), waveInk)
             sx += 1.6
           cv.popClip()
@@ -208,7 +266,7 @@ object Timeline:
               val tw = math.max(8.0, bh * 16.0 / 9.0)
               var sx = x1 + 1
               while sx < x2 - 1 do
-                t.at((sx - x1) / span) match
+                t.at(srcFrac((sx - x1) / span)) match
                   case img: RasterImage => cv.drawImage(img, Rect(sx, 2, tw, bh))
                   case null             => ()
                 sx += tw

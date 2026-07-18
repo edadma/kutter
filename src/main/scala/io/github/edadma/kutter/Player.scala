@@ -374,10 +374,13 @@ object Player:
         t.start(ProfileName, clip.path)
         thumbCache(clip.path) = t
 
+    // A waveform spans the whole source (like the filmstrip), so a trimmed placement can show exactly
+    // the slice it plays. Its peak count is the source length when known, falling back to the placement's
+    // length for a clip from a project saved before source lengths were measured.
     val waveCache = scala.collection.mutable.LinkedHashMap.empty[String, Waveform]
     for track <- project.audioTracks; pc <- track.ordered; clip <- project.clipFor(pc.clipId) do
       if !waveCache.contains(clip.path) then
-        val w = new Waveform(math.max(1, pc.length))
+        val w = new Waveform(math.max(1, if clip.frames > 0 then clip.frames else pc.length))
         w.start(ProfileName, clip.path, profile.fps)
         waveCache(clip.path) = w
 

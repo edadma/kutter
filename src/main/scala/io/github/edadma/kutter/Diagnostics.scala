@@ -23,7 +23,7 @@ private[kutter] object Diagnostics:
     * A1, sharing a link id — for the probes and helpers that want a project built around one source.
     * Both placements run `len` frames from the clip's head. */
   def videoProject(path: String, len: Int = DemoLength): Project =
-    val clip = MediaClip.make(path, MediaKind.Video)
+    val clip = MediaClip.make(path, MediaKind.Video, len)
     val link = Some("demo-link")
     Project.blank.copy(
       bin = List(clip),
@@ -144,6 +144,24 @@ private[kutter] object Diagnostics:
       check("place fits gap", Timeline.freePlacement(100, 200, Seq((0, 80), (200, 60)), Nil), (100, 100))
       check("place snaps inside", Timeline.freePlacement(50, 100, Seq((0, 120)), Nil), (120, 100))
       check("place pair snaps both", Timeline.freePlacement(50, 30, Seq((0, 100)), Seq((90, 50))), (140, 30))
+
+      // clipEdgeAt: a press within a few pixels of a block's left/right edge picks that edge to trim; a
+      // press on the body picks neither (the caller then treats it as a move). With the 1:1 mapping,
+      // cb0 spans px 0..100 and cb1 spans 150..250.
+      check("edge left", Timeline.clipEdgeAt(2.0, total, width, Seq(cb0, cb1)), Some(("c0", Timeline.TrimEdge.Left)))
+      check("edge right", Timeline.clipEdgeAt(100.0, total, width, Seq(cb0, cb1)), Some(("c0", Timeline.TrimEdge.Right)))
+      check("edge body none", Timeline.clipEdgeAt(50.0, total, width, Seq(cb0, cb1)), None)
+      check("edge next left", Timeline.clipEdgeAt(150.0, total, width, Seq(cb0, cb1)), Some(("c1", Timeline.TrimEdge.Left)))
+
+      // clipTrimBounds: a placement at start 100 playing 80 frames from in-point 20 of a 200-frame
+      // source, between neighbours [0,50) and [300,360). The right edge may grow to the source's end
+      // (200-20-80=100) or the next clip (300-180=120), whichever is nearer, and shrink to a 1-frame
+      // clip; the left edge may move back to the in-point limit (-20) or the previous clip (-50),
+      // whichever is nearer, and forward to a 1-frame clip (79). A short source caps the right extension
+      // at the source's own end.
+      check("trim right", Timeline.clipTrimBounds(Timeline.TrimEdge.Right, 100, 20, 80, 200, total, Seq((0, 50), (300, 60))), (-79, 100))
+      check("trim left", Timeline.clipTrimBounds(Timeline.TrimEdge.Left, 100, 20, 80, 200, total, Seq((0, 50), (300, 60))), (-20, 79))
+      check("trim right at source end", Timeline.clipTrimBounds(Timeline.TrimEdge.Right, 100, 20, 80, 100, total, Nil), (-79, 0))
 
       // Batch import: the time parser (timecodes / seconds) and one whole HOCON list.
       check("time m:ss", BatchImport.parseTime("1:12"), Right(72.0))

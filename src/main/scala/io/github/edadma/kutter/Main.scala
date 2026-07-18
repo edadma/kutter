@@ -119,6 +119,20 @@ private val App: Component[Session] = component[Session] { initial =>
   val cdragHi    = useRef(0)
   val cdragLast  = useRef(0)
 
+  // Trimming a placed clip's edge. On grab we remember the clip (`tdragId`), which edge (`tdragEdge`),
+  // the frame grabbed at (`tdragGrab`), and the trim group — the clip plus a linked partner — as
+  // (placement id, start, in-point, length) snapshots (`tdragGroup`), so a linked pair trims by one
+  // delta and stays locked. `tdragLo`/`tdragHi` bound that delta to what stays on the source and in the
+  // clip's gap (the tightest across the group); `tdragLast` skips a redundant edit. `tdragId == null`
+  // means no trim in progress.
+  val tdragId    = useRef[String | Null](null)
+  val tdragEdge  = useRef[Timeline.TrimEdge](Timeline.TrimEdge.Right)
+  val tdragGrab  = useRef(0)
+  val tdragGroup = useRef[List[(String, Int, Int, Int)]](Nil)
+  val tdragLo    = useRef(0)
+  val tdragHi    = useRef(0)
+  val tdragLast  = useRef(0)
+
   // Poll the player's position to drive the scrubber — but not while scrubbing, when the drag owns
   // the position and a poll would fight the cursor.
   useInterval(
@@ -377,6 +391,74 @@ private val App: Component[Session] = component[Session] { initial =>
   // End a clip drag.
   def endClipDrag(): Unit = cdragId.current = null
 
+  // The source length a placement can be trimmed against: the measured source frame count, or — for a
+  // clip from a project saved before lengths were measured — the placement's own end, so an old clip
+  // trims (shrinks) but isn't extended past what it already shows.
+  def srcLenOf(pc: PlacedClip): Int =
+    project.clipFor(pc.clipId).map(c => if c.frames > 0 then c.frames else pc.inPoint + pc.length)
+      .getOrElse(pc.inPoint + pc.length)
+
+  // Begin trimming the `edge` of clip `id`, grabbed at `grabFrame`: select it, resolve its trim group
+  // (the linked pair, if any), snapshot each member's window, and compute the feasible edge delta — the
+  // tightest bound across every member, so a linked pair trims together without either half running off
+  // the source or over a neighbour.
+  def beginTrim(id: String, edge: Timeline.TrimEdge, grabFrame: Int): Unit =
+    selectClip(id)
+    val group = moveGroupOf(project, id)
+    if group.nonEmpty then
+      var lo = Int.MinValue
+      var hi = Int.MaxValue
+      for (trackId, pc) <- group do
+        val others = project.tracks.find(_.id == trackId).toList
+          .flatMap(_.clips).filterNot(c => group.exists(_._2.id == c.id)).map(c => (c.timelineStart, c.length))
+        val (blo, bhi) = Timeline.clipTrimBounds(edge, pc.timelineStart, pc.inPoint, pc.length, srcLenOf(pc), total, others)
+        lo = math.max(lo, blo)
+        hi = math.min(hi, bhi)
+      tdragId.current    = id
+      tdragEdge.current  = edge
+      tdragGrab.current  = grabFrame
+      tdragGroup.current = group.map { case (_, pc) => (pc.id, pc.timelineStart, pc.inPoint, pc.length) }
+      tdragLo.current    = lo
+      tdragHi.current    = hi
+      tdragLast.current  = 0
+
+  // Continue a trim: move the grabbed edge by the cursor's travel from the grab, snapped so the edge
+  // lands on a half-second boundary (to trim to a round duration), clamped to the group's feasible
+  // delta, and apply it to every member — a right-edge trim changes the length, a left-edge trim moves
+  // the in-point and start together (shortening from the head). Only edits when the delta changes.
+  def dragTrim(curFrame: Int): Unit =
+    tdragId.current match
+      case id: String =>
+        val want = curFrame - tdragGrab.current
+        val snap = math.max(1, math.round(fps / 2).toInt)
+        val edge = tdragEdge.current
+        val origEdge = tdragGroup.current.find(_._1 == id) match
+          case Some((_, s, _, l)) => edge match
+              case Timeline.TrimEdge.Right => s + l
+              case Timeline.TrimEdge.Left  => s
+          case None => 0
+        val snapped = math.round((origEdge + want).toDouble / snap).toInt * snap - origEdge
+        val delta   = math.max(tdragLo.current, math.min(tdragHi.current, snapped))
+        if delta != tdragLast.current then
+          tdragLast.current = delta
+          val origs = tdragGroup.current.map { case (pid, s, ip, l) => pid -> (s, ip, l) }.toMap
+          editProject(p =>
+            p.copy(tracks = p.tracks.map(t =>
+              t.copy(clips = t.clips.map(c =>
+                origs.get(c.id) match
+                  case Some((s, ip, l)) =>
+                    edge match
+                      case Timeline.TrimEdge.Right => c.copy(length = l + delta)
+                      case Timeline.TrimEdge.Left  => c.copy(timelineStart = s + delta, inPoint = ip + delta, length = l - delta)
+                  case None => c,
+              )),
+            )),
+          )
+      case null => ()
+
+  // End a trim.
+  def endTrim(): Unit = tdragId.current = null
+
   // Unlink the clip `id` from its A/V partner: clear the shared link id on both halves so the picture
   // and its sound move (and later trim) independently. The graph is unchanged — the link is a timeline
   // grouping, not a render property — so this rides the live graph-swap like any other project edit.
@@ -589,7 +671,7 @@ private val App: Component[Session] = component[Session] { initial =>
   def importClip(pathStr: String, kind: MediaKind): Unit =
     dirty.current = true
     val len      = Player.mediaLength(pathStr)
-    val clip     = MediaClip.make(pathStr, kind)
+    val clip     = MediaClip.make(pathStr, kind, len)
     val withClip = project.copy(bin = project.bin :+ clip)
     val placed = kind match
       case MediaKind.Video =>
@@ -947,6 +1029,8 @@ private val App: Component[Session] = component[Session] { initial =>
           label    = clip.name,
           linked   = pc.link.isDefined,
           selected = selectedClipId.contains(pc.id),
+          inPoint  = pc.inPoint,
+          srcLen   = clip.frames,
           thumbs   = thumbs,
           waveform = wave,
         )
@@ -1000,19 +1084,25 @@ private val App: Component[Session] = component[Session] { initial =>
     val lane =
       t.overlays match
         case null =>
-          // A media lane: a press on a clip selects it and begins a move (a linked pair moves together);
-          // a press on the empty part of the lane scrubs.
+          // A media lane: a press near a clip's edge begins a trim, a press on its body selects it and
+          // begins a move (a linked pair does both together), a press on the empty lane scrubs. The edge
+          // is checked first so it stays grabbable even on a narrow clip.
           canvas(
             onMouseDown = e =>
               val f = Timeline.frameAt(e.localX, total, e.size.width)
-              Timeline.clipAt(e.localX, total, e.size.width, t.clips) match
-                case Some(id) => beginClipDrag(id, f)
-                case None     => beginScrub(f),
+              Timeline.clipEdgeAt(e.localX, total, e.size.width, t.clips) match
+                case Some((id, edge)) => beginTrim(id, edge, f)
+                case None =>
+                  Timeline.clipAt(e.localX, total, e.size.width, t.clips) match
+                    case Some(id) => beginClipDrag(id, f)
+                    case None     => beginScrub(f),
             onMouseMove = e =>
               val f = Timeline.frameAt(e.localX, total, e.size.width)
-              if cdragId.current != null then dragClip(f)
+              if tdragId.current != null then dragTrim(f)
+              else if cdragId.current != null then dragClip(f)
               else if scrubbing.current then scrubTo(f),
             onMouseUp = _ =>
+              endTrim()
               endClipDrag()
               endScrub(),
           )(paint)
