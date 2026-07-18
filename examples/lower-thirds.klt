@@ -17,7 +17,7 @@
 # project (or clear the demo cards) to see just these.
 
 lowerThirds = [
-  { name = "Big Buck Bunnyasdf", title = "an open movie by the Blender Foundation", in = "0:00.5", out = "0:03.5" }
+  { name = "Big Buck Bunny", title = "an open movie by the Blender Foundation", in = "0:00.5", out = "0:03.5" }
   { name = "Directed by",    title = "Sacha Goedegebure",  in = "0:04", out = "0:07", style = bold-bar }
   { name = "Music",          title = "Jan Morgenstern",    in = "0:07.5", out = "0:10.5", style = minimal, fade = 18 }
   { name = "Typeset by",     title = "the texish engine",  in = "0:11", out = "0:14", style = texish-card }
