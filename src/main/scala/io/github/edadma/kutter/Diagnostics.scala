@@ -137,6 +137,14 @@ private[kutter] object Diagnostics:
       check("clip bounds gap", Timeline.clipStartBounds(100, 50, total, Seq((0, 80), (200, 60))), (80, 150))
       check("clip bounds free", Timeline.clipStartBounds(100, 50, total, Nil), (0, total - 50))
 
+      // freePlacement: dropping a clip at the playhead. On an empty track it lands where dropped; in a
+      // gap smaller than the source it is trimmed to fit; dropped inside a clip it snaps to that clip's
+      // end; and a linked pair snaps past clips on either track so picture and sound share one start.
+      check("place empty", Timeline.freePlacement(100, 50, Nil, Nil), (100, 50))
+      check("place fits gap", Timeline.freePlacement(100, 200, Seq((0, 80), (200, 60)), Nil), (100, 100))
+      check("place snaps inside", Timeline.freePlacement(50, 100, Seq((0, 120)), Nil), (120, 100))
+      check("place pair snaps both", Timeline.freePlacement(50, 30, Seq((0, 100)), Seq((90, 50))), (140, 30))
+
       // Batch import: the time parser (timecodes / seconds) and one whole HOCON list.
       check("time m:ss", BatchImport.parseTime("1:12"), Right(72.0))
       check("time h:mm:ss", BatchImport.parseTime("1:00:00"), Right(3600.0))

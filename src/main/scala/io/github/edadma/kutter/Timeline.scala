@@ -90,6 +90,29 @@ object Timeline:
     val nextStart = others.collect { case (s, _) if s >= origEnd => s }.minOption.getOrElse(total)
     (math.max(0, prevEnd), math.max(0, math.min(total, nextStart) - length))
 
+  /** Where a new placement of a clip `srcLen` frames long should land when dropped at `atFrame`, given
+    * the existing clips on the two tracks it occupies — `aBlocks` and `bBlocks` as (start, length) pairs
+    * (an unlinked clip passes its one track's blocks and `Nil` for the other). The drop point is snapped
+    * forward past any clip it falls inside on either track (repeatedly, since clearing one track's clip
+    * can land inside another's), then the length is trimmed to fit the gap before the next clip on either
+    * track and never to run past the source's own length. Returns (start, length); a length of 0 or less
+    * means the drop point has no room. Placing a linked A/V pair uses both tracks so picture and sound
+    * land at one start and one length; a single clip uses one. */
+  def freePlacement(atFrame: Int, srcLen: Int, aBlocks: Seq[(Int, Int)], bBlocks: Seq[(Int, Int)]): (Int, Int) =
+    val all   = aBlocks ++ bBlocks
+    var start = math.max(0, atFrame)
+    var moved = true
+    while moved do
+      moved = false
+      for (s, l) <- all do
+        if start >= s && start < s + l then
+          start = s + l
+          moved = true
+    val nextA  = aBlocks.collect { case (s, _) if s >= start => s }.minOption.getOrElse(Int.MaxValue)
+    val nextB  = bBlocks.collect { case (s, _) if s >= start => s }.minOption.getOrElse(Int.MaxValue)
+    val room   = math.min(nextA, nextB) - start
+    (start, math.min(srcLen, room))
+
   private def playheadInk(theme: Theme): Color = theme.accent
 
   /** A readable ink for a caption over `bg`: black on a light block, white on a dark one. */

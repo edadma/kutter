@@ -28,6 +28,12 @@ import scala.io.Source
 // placed, so lower thirds can be laid out ahead of the video — 10 seconds.
 private val DefaultTimelineFrames = 300
 
+// How far the timeline runs past its content, as a floor in frames (10 seconds) — the tail of empty
+// space that lets a clip always be slid rightward (to open a gap before it for an intro) and gives a
+// drop near the end room. The actual tail is this or half the content, whichever is larger, so even a
+// long clip has generous runway; see where `total` is computed.
+private val TimelineTailFrames = 300
+
 // A pending confirmation: the dialog shows its title and message, and runs `action` on confirm. One
 // state drives every destructive prompt (remove a clip, clear the project), rather than a flag each.
 private final case class ConfirmSpec(title: String, message: String, confirmLabel: String, action: () => Unit)
@@ -220,14 +226,21 @@ private val App: Component[Session] = component[Session] { initial =>
   // must be at least as long as so a clip dragged toward the end still has room and the ruler covers it.
   val projectExtent = math.max(project.contentEnd, project.lowerThirds.map(_.outFrame + 1).maxOption.getOrElse(0))
 
-  // The timeline's length and frame rate. With a project open the length is the player's graph length,
-  // grown to cover any edit made since it opened (a clip moved past the old end) so the ruler and the
-  // drag bounds keep up before the next re-open refreshes it. Before a player opens, the project still
-  // has a working timeline — long enough to lay out lower thirds ahead of footage — so a title can be
-  // authored, positioned, and previewed-in-place before a video is placed. The rate is the profile's.
-  val (total, fps) = playerRef.current match
+  // How far the project's content reaches, and the frame rate. With a project open this is the player's
+  // graph length, grown to cover any edit made since it opened (a clip moved past the old end) so the
+  // ruler and drag bounds keep up before the next re-open refreshes it. Before a player opens, the
+  // project still has a working timeline — long enough to lay out lower thirds ahead of footage. The
+  // rate is the profile's.
+  val (contentReach, fps) = playerRef.current match
     case p: Player => (math.max(p.totalFrames, projectExtent), p.fps)
     case null      => (math.max(DefaultTimelineFrames, projectExtent), 30.0)
+
+  // The timeline's length: the content plus a tail of empty space, so a clip can always be slid right
+  // (opening a gap before it for an intro) and a drop near the end has room. The tail grows with the
+  // content — projectExtent tracks a moved clip — so within a project the runway never runs out; the
+  // graph itself is only sized to the content (the black base ends at `contentReach`), so the tail is
+  // purely timeline headroom, not rendered frames.
+  val total    = contentReach + math.max(TimelineTailFrames, contentReach / 2)
   val progress = math.min(1.0, frame.toDouble / total)
 
   // Seek the displayed position to `fraction` of the timeline immediately (so the thumb tracks with no
@@ -359,6 +372,14 @@ private val App: Component[Session] = component[Session] { initial =>
 
   // End a clip drag.
   def endClipDrag(): Unit = cdragId.current = null
+
+  // Unlink the clip `id` from its A/V partner: clear the shared link id on both halves so the picture
+  // and its sound move (and later trim) independently. The graph is unchanged — the link is a timeline
+  // grouping, not a render property — so this rides the live graph-swap like any other project edit.
+  def unlinkPlacement(id: String): Unit =
+    val group = moveGroupOf(project, id).map(_._2.id).toSet
+    editProject(p => p.copy(tracks = p.tracks.map(t =>
+      t.copy(clips = t.clips.map(c => if group.contains(c.id) then c.copy(link = None) else c)))))
 
   // The scrubber is suit's Slider: grabbing it pauses and holds on the frame (remembering whether to
   // resume), dragging seeks, and releasing resumes if it was playing. The Slider owns the pointer
@@ -608,6 +629,45 @@ private val App: Component[Session] = component[Session] { initial =>
     setSelectedClipId(None)
     reopen(p, path)
 
+  // Place a bin clip onto the timeline at the playhead. The drop lands at the current frame, snapped
+  // past any clip already there and trimmed to fit the gap, so a track stays a non-overlapping sequence
+  // (see `Timeline.freePlacement`). A **video** clip drops as a linked A/V pair — picture on the first
+  // video track, sound on the first audio track, at one start across both — so the pair reads and moves
+  // as one; an **audio** clip drops on the first audio track alone. Placing changes the lanes'
+  // generators, so this re-opens the player, as importing does. Nothing happens when the playhead has no
+  // room (a length of 0). The source length is measured against the profile, so on the UI/main thread.
+  def placeAtPlayhead(clip: MediaClip): Unit =
+    val srcLen = Player.mediaLength(clip.path)
+    clip.kind match
+      case MediaKind.Video =>
+        (project.videoTracks.headOption, project.audioTracks.headOption) match
+          case (Some(v), Some(a)) =>
+            val (start, length) = Timeline.freePlacement(
+              frame, srcLen,
+              v.clips.map(c => (c.timelineStart, c.length)),
+              a.clips.map(c => (c.timelineStart, c.length)),
+            )
+            if length > 0 then
+              val link = Some(s"lnk-${System.nanoTime()}")
+              val p = project.copy(tracks = project.tracks.map { t =>
+                if t.id == v.id || t.id == a.id then
+                  t.copy(clips = t.clips :+ PlacedClip.make(clip.id, start, length, link = link))
+                else t
+              })
+              dirty.current = true
+              reopen(p, path)
+          case _ => ()
+      case MediaKind.Audio =>
+        project.audioTracks.headOption.foreach { a =>
+          val (start, length) = Timeline.freePlacement(
+            frame, srcLen, a.clips.map(c => (c.timelineStart, c.length)), Nil,
+          )
+          if length > 0 then
+            val p = project.updateTrack(a.id)(t => t.copy(clips = t.clips :+ PlacedClip.make(clip.id, start, length)))
+            dirty.current = true
+            reopen(p, path)
+        }
+
   // The media on the timeline as a comparable key — each track's kind and its placements (source path,
   // in-point, length, start) in order — so opening a project with the same media reuses the live
   // graph-swap and a different arrangement re-opens.
@@ -699,6 +759,7 @@ private val App: Component[Session] = component[Session] { initial =>
     row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
       svg(if clip.kind == MediaKind.Audio then volumeIcon else playIcon, width = 16, height = 16),
       box(flex = 1)(text(clip.name, size = 13, color = theme.surfaceText, maxLines = 1)),
+      textButton("Place", () => placeAtPlayhead(clip)),
       box(onClick = _ => setConfirm(Some(ConfirmSpec(
         "Remove clip?",
         s"Remove “${clip.name}” from the project? Its placements on the timeline go with it; the lower thirds are kept.",
@@ -818,7 +879,10 @@ private val App: Component[Session] = component[Session] { initial =>
       ),
       if pc.link.isDefined then text("Linked A/V — picture and sound move together.", size = 11, color = theme.accent, maxLines = 0)
       else text("Unlinked.", size = 11, color = theme.border),
-      textButton("Remove from timeline", () => removePlacement(pc.id)),
+      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
+        textButton("Remove from timeline", () => removePlacement(pc.id)),
+        if pc.link.isDefined then textButton("Unlink", () => unlinkPlacement(pc.id)) else spacer(),
+      ),
     )
 
   // The inspector (right): the selected clip's details, else the selected lower third's editor, else a
