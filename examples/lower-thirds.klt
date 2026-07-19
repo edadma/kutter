@@ -48,7 +48,10 @@ lowerThirds = [
       \pagecolor{transparent}
       \vfill
       \set fboxsep {10}
-      \colorbox[0.55]{black}{\parbox[c][220pt][t]{1260pt}{
+      // A verse number the way the usfm package sets one: a small Latin Modern sans-bold numeral
+      // raised into superscript with a hair of space after it, sans whatever the prose face is.
+      \def vnum n {\raise 5pt \hbox{\font lmroman 15 {sans bold}\n}\kern 2 }
+      \colorbox[0.7]{black}{\parbox[c][220pt][t]{1260pt}{
       \color{white}
       \set parindent {0}
       \font ebgaramond 30 bold
@@ -56,8 +59,8 @@ lowerThirds = [
       \par
       \vskip 14
       \font ebgaramond 28 regular
-      For this is how God loved the world: He gave his one and only Son, so that everyone who
-      believes in him will not perish but have eternal life. God sent his Son into the world not
+      \vnum{16}For this is how God loved the world: He gave his one and only Son, so that everyone who
+      believes in him will not perish but have eternal life. \vnum{17}God sent his Son into the world not
       to judge the world, but to save the world through him.
       }}
   """ }
