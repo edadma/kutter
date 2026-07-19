@@ -52,6 +52,88 @@ private def timecode(frames: Int, fps: Double): String =
   val secs = cs / 100
   f"${secs / 60}:${secs % 60}%02d.${cs % 100}%02d"
 
+// Everything the transport needs from the editor, as a plain bundle. `player` reads the monitor the
+// transport currently drives (the active one), so the transport can poll its position without the
+// editor re-rendering; the callbacks reach back into the editor's playback state. `playing`, `total`,
+// `label`, and `volume` are the values that change infrequently (a play/pause, a mode switch, a
+// volume ride) — when they do, the editor re-renders and hands the transport a fresh bundle.
+private final case class TransportProps(
+    player:       () => Player | Null,
+    total:        Int,
+    fps:          Double,
+    playing:      Boolean,
+    label:        String,
+    volume:       Double,
+    onToggle:     () => Unit,
+    onSeek:       Double => Unit,
+    onScrubStart: () => Unit,
+    onScrubEnd:   () => Unit,
+    onVolume:     Double => Unit,
+)
+
+// The transport — the scrubber over play / timecode / frame index / name / master volume — as its own
+// component, so its position readout ticking during playback re-renders only this small subtree
+// (riposte re-renders the dirty instance, not the root) rather than the whole editor. It polls the
+// active monitor's position itself, into local state, a few times a second; the editor drives the
+// timeline playhead separately through a repaint (see `App`'s poll), so the expensive track lanes do
+// not reconcile as the playhead moves.
+private val Transport: Component[TransportProps] = component[TransportProps] { p =>
+  val theme = Theme.dark
+
+  // The polled position of the active monitor — the readout and the scrubber thumb. Held here, not in
+  // the editor, so advancing it each tick re-renders only the transport.
+  val (frame, setFrame, _) = useState(0)
+
+  // While this scrubber owns the drag, the Slider shows the cursor directly, so the poll must not fight
+  // it. A local ref (the editor has its own for timeline scrubs); no re-render needed to read it.
+  val scrubbing = useRef(false)
+
+  // The poll's timer is armed once and never re-armed (its deps are constant), so its callback would
+  // otherwise close over the accessor from the first render and always read whichever monitor was
+  // active then. Mirror the latest accessor into a ref each render so the poll reads the monitor the
+  // transport currently drives — switching to the clip monitor then tracks the clip, not the project.
+  val activeMonitor = useRef(p.player)
+  activeMonitor.current = p.player
+
+  useInterval(
+    () =>
+      if !scrubbing.current then
+        activeMonitor.current() match
+          case pl: Player => setFrame(pl.position)
+          case null       => (),
+    100,
+  )
+
+  val progress = if p.total > 0 then math.min(1.0, frame.toDouble / p.total) else 0.0
+
+  def iconButton(icon: SvgImage, onClick: () => Unit): VNode =
+    box(onClick = _ => onClick(), cursor = Cursor.Pointer, padding = EdgeInsets.all(8), radius = 8)(
+      svg(icon, width = 22, height = 22),
+    )
+
+  val scrubber = Slider(
+    value         = progress,
+    onChange      = p.onSeek,
+    onChangeStart = _ => { scrubbing.current = true; p.onScrubStart() },
+    onChangeEnd   = _ => { scrubbing.current = false; p.onScrubEnd() },
+  )
+
+  box(bg = theme.surface, padding = EdgeInsets.symmetric(horizontal = 16, vertical = 10))(
+    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 10)(
+      scrubber,
+      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 12)(
+        iconButton(if p.playing then pauseIcon else playIcon, () => p.onToggle()),
+        text(s"${timecode(frame, p.fps)} / ${timecode(p.total, p.fps)}", size = 14, color = theme.surfaceText, mono = true),
+        text(s"frame $frame / ${p.total}", size = 12, color = theme.border, mono = true),
+        spacer(),
+        text(p.label, size = 13, color = theme.surfaceText),
+        svg(volumeIcon, width = 18, height = 18),
+        sizedBox(width = 90)(Slider(p.volume, p.onVolume)),
+      ),
+    ),
+  )
+}
+
 private val App: Component[Session] = component[Session] { initial =>
   val theme = Theme.dark
 
@@ -88,10 +170,12 @@ private val App: Component[Session] = component[Session] { initial =>
   val (playing, setPlaying, _) = useState(false) // a project loads paused on its first frame, like an editor
   val (volume, setVolume, _)   = useState(initial.project.master)
 
-  // The playback position, polled from the player a few times a second to drive the progress bar.
-  // The player exposes it as a plain volatile read (the decode thread writes it), so this never
-  // touches the graph.
-  val (frame, setFrame, _) = useState(0)
+  // The project timeline's playhead frame. A ref, not state: the timeline lanes read it while being
+  // repainted (not re-rendered), so the playhead can advance during playback without reconciling the
+  // whole editor. The poll below advances it and asks for a repaint; handlers that act at the playhead
+  // (scrub, place a clip, add a lower third) read and write it directly. The player writes its own
+  // `position` from the decode thread; this ref mirrors it for the view.
+  val playheadRef = useRef(0)
 
   // The playback engine. Held in a ref because it is imperative state owned across renders, not
   // something the view derives from — the handlers reach it, the view does not.
@@ -105,13 +189,12 @@ private val App: Component[Session] = component[Session] { initial =>
   // The clip monitor's player and texture — a light, one-clip player opened when a bin clip is picked for
   // preview, and closed when the project monitor is shown again, so only one player is ever engaged.
   // `clipPlayerId` records which bin clip it currently shows, so re-selecting the same clip doesn't
-  // needlessly reopen it. `clipLayer`/`clipFrame`/`clipTotal` mirror the project monitor's `layer`/`frame`
-  // /`total` for the clip preview and its own scrubber.
+  // needlessly reopen it. `clipLayer` is the clip preview's video layer and `clipTotal` its length; the
+  // transport polls the clip player's position itself, so there is no `clipFrame` state.
   val clipPlayerRef  = useRef[Player | Null](null)
   val clipTextureRef = useRef[VideoTexture | Null](null)
   val clipPlayerId   = useRef[String | Null](null)
   val (clipLayer, setClipLayer, _) = useState[VideoLayer | Null](null)
-  val (clipFrame, setClipFrame, _) = useState(0)
   val (clipTotal, setClipTotal, _) = useState(0)
 
   // Whether the clip monitor is showing, and the player the transport currently drives. Everything the
@@ -163,18 +246,23 @@ private val App: Component[Session] = component[Session] { initial =>
   val tdragHi    = useRef(0)
   val tdragLast  = useRef(0)
 
-  // Poll the player's position to drive the scrubber — but not while scrubbing, when the drag owns
-  // the position and a poll would fight the cursor.
+  // Advance the timeline playhead from the project player's position and ask for a repaint — but only
+  // when the frame has actually moved, so a paused editor asks for no repaints and the render loop
+  // stays idle. This never re-renders the editor (no state write); it drives the timeline lanes, which
+  // read `playheadRef` while being repainted. Skipped while a timeline scrub owns the position. The
+  // transport polls the active monitor's position on its own (see [[Transport]]). ~30/s for a smooth
+  // playhead without the churn of reconciling the tree.
   useInterval(
     () =>
       if !scrubbing.current then
         playerRef.current match
-          case p: Player => setFrame(p.position)
-          case null      => ()
-        clipPlayerRef.current match
-          case p: Player => setClipFrame(p.position)
-          case null      => (),
-    100,
+          case p: Player =>
+            val pos = p.position
+            if pos != playheadRef.current then
+              playheadRef.current = pos
+              Repaint.request()
+          case null => (),
+    33,
   )
 
   // A project has something to play — and so wants a player and preview — once it has media on a track
@@ -235,7 +323,6 @@ private val App: Component[Session] = component[Session] { initial =>
     player.setVolume(volume)
     player.seek(0)
     setClipLayer(texture)
-    setClipFrame(0)
     setClipTotal(player.totalFrames)
 
   // Show the clip monitor for a bin clip: select it, pause the project player, open the clip player (only
@@ -380,17 +467,18 @@ private val App: Component[Session] = component[Session] { initial =>
   // purely timeline headroom, not rendered frames.
   val total    = contentReach + math.max(TimelineTailFrames, contentReach / 2)
 
-  // What the transport shows and drives: the active monitor's position, length, and played fraction. In
-  // the project monitor these are the timeline's; in the clip monitor they are the previewed clip's own.
-  val activeFrame    = if isClip then clipFrame else frame
-  val activeTotal    = if isClip then clipTotal else total
-  val activeProgress = if activeTotal > 0 then math.min(1.0, activeFrame.toDouble / activeTotal) else 0.0
+  // The active monitor's length: the timeline's in the project monitor, the previewed clip's in the
+  // clip monitor. The transport derives its own played fraction from this and the position it polls.
+  val activeTotal = if isClip then clipTotal else total
 
-  // Seek the active monitor to `fraction` of its length immediately (so the thumb tracks with no decode
-  // round-trip) and ask its player to render that frame.
+  // Seek the active monitor to `fraction` of its length and render that frame. In the project monitor
+  // the timeline playhead follows at once (set the ref and repaint); the transport's own readout tracks
+  // the cursor through the Slider. In the clip monitor only the clip player seeks.
   def seekToFraction(fraction: Double): Unit =
     val f = math.round(fraction * activeTotal).toInt
-    if isClip then setClipFrame(f) else setFrame(f)
+    if !isClip then
+      playheadRef.current = f
+      Repaint.request()
     activePlayer() match
       case p: Player => p.seek(f)
       case null      => ()
@@ -405,13 +493,15 @@ private val App: Component[Session] = component[Session] { initial =>
         scrubbing.current  = true
         wasPlaying.current = p.isPlaying
         p.pause()
-        setFrame(frame)
+        playheadRef.current = frame
+        Repaint.request()
         p.seek(frame)
       case null => ()
 
   // Continue a scrub: track the cursor to `frame`.
   def scrubTo(frame: Int): Unit =
-    setFrame(frame)
+    playheadRef.current = frame
+    Repaint.request()
     playerRef.current match
       case p: Player => p.seek(frame)
       case null      => ()
@@ -612,36 +702,24 @@ private val App: Component[Session] = component[Session] { initial =>
   def toggleMute(id: String): Unit =
     editProject(_.updateTrack(id)(t => t.copy(muted = !t.muted)))
 
-  // The scrubber is suit's Slider: grabbing it pauses and holds on the frame (remembering whether to
-  // resume), dragging seeks, and releasing resumes if it was playing. The Slider owns the pointer
-  // capture, direct cursor tracking, and the played-progress fill; kutter only supplies the playback
-  // behaviour through the drag brackets.
-  val scrubber = Slider(
-    value    = activeProgress,
-    onChange = seekToFraction,
-    onChangeStart = _ =>
-      activePlayer() match
-        case p: Player =>
-          scrubbing.current  = true
-          wasPlaying.current = p.isPlaying
-          p.pause()
-        case null => (),
-    onChangeEnd = _ =>
-      scrubbing.current = false
-      if wasPlaying.current then
-        activePlayer() match
-          case p: Player => p.play()
-          case null      => (),
-  )
+  // Begin a scrub from the transport's own Slider: pause the active monitor and remember whether to
+  // resume. (The Slider owns the cursor tracking and the played-progress fill; kutter supplies only the
+  // playback behaviour through these brackets, which the transport calls.)
+  def onScrubStart(): Unit =
+    activePlayer() match
+      case p: Player =>
+        scrubbing.current  = true
+        wasPlaying.current = p.isPlaying
+        p.pause()
+      case null => ()
 
-  // A clickable icon: a padded, rounded hit target around a vector glyph.
-  def iconButton(icon: SvgImage, onClick: () => Unit): VNode =
-    box(
-      onClick = _ => onClick(),
-      cursor  = Cursor.Pointer,
-      padding = EdgeInsets.all(8),
-      radius  = 8,
-    )(svg(icon, width = 22, height = 22))
+  // End a transport scrub: resume if it was playing.
+  def onScrubEnd(): Unit =
+    scrubbing.current = false
+    if wasPlaying.current then
+      activePlayer() match
+        case p: Player => p.play()
+        case null      => ()
 
   // Master volume: drive the displayed level and the active monitor's audio gain. In the project monitor
   // it is the project master and persists (so a reopen restores it); in the clip monitor it only rides the
@@ -659,22 +737,24 @@ private val App: Component[Session] = component[Session] { initial =>
     if isClip then selectedBinId.flatMap(id => project.bin.find(_.id == id)).map(_.name).getOrElse("Clip")
     else project.bin.headOption.map(_.name).getOrElse(project.name)
 
-  // The transport: the scrubber over a row of play / timecode / frame index / name / master volume.
+  // The transport, as its own component so its position readout ticking during playback re-renders only
+  // it, not the editor (whose timeline lanes follow the playhead through a repaint instead — see the
+  // poll above). It polls the active monitor itself; the editor hands it the values that change rarely
+  // (play state, length, name, volume) and the callbacks that reach playback.
   val transport =
-    box(bg = theme.surface, padding = EdgeInsets.symmetric(horizontal = 16, vertical = 10))(
-      col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 10)(
-        scrubber,
-        row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 12)(
-          iconButton(if playing then pauseIcon else playIcon, () => toggle()),
-          text(s"${timecode(activeFrame, fps)} / ${timecode(activeTotal, fps)}", size = 14, color = theme.surfaceText, mono = true),
-          text(s"frame $activeFrame / $activeTotal", size = 12, color = theme.border, mono = true),
-          spacer(),
-          text(transportLabel, size = 13, color = theme.surfaceText),
-          svg(volumeIcon, width = 18, height = 18),
-          sizedBox(width = 90)(Slider(volume, onVolume)),
-        ),
-      ),
-    )
+    Transport(TransportProps(
+      player       = () => activePlayer(),
+      total        = activeTotal,
+      fps          = fps,
+      playing      = playing,
+      label        = transportLabel,
+      volume       = volume,
+      onToggle     = () => toggle(),
+      onSeek       = seekToFraction,
+      onScrubStart = () => onScrubStart(),
+      onScrubEnd   = () => onScrubEnd(),
+      onVolume     = onVolume,
+    ))
 
   // Wrap content in a rounded, bordered card — the editor's panel shell. It clips, so a video's
   // letterbox or a canvas's fill honours the rounded corners.
@@ -707,7 +787,7 @@ private val App: Component[Session] = component[Session] { initial =>
   def addLowerThird(): Unit =
     val id    = s"lt-${System.nanoTime()}"
     val len   = math.min(90, math.max(1, total - 1))
-    val start = math.max(0, math.min(frame, total - 1 - len))
+    val start = math.max(0, math.min(playheadRef.current, total - 1 - len))
     val lt    = LowerThird(id, "Name", "Title", start, start + len)
     editProject(p => p.copy(lowerThirds = p.lowerThirds :+ lt))
     setSelectedId(Some(id))
@@ -885,7 +965,7 @@ private val App: Component[Session] = component[Session] { initial =>
         (project.videoTracks.headOption, project.audioTracks.headOption) match
           case (Some(v), Some(a)) =>
             val (start, length) = Timeline.freePlacement(
-              frame, srcLen,
+              playheadRef.current, srcLen,
               v.clips.map(c => (c.timelineStart, c.length)),
               a.clips.map(c => (c.timelineStart, c.length)),
             )
@@ -902,7 +982,7 @@ private val App: Component[Session] = component[Session] { initial =>
       case MediaKind.Audio =>
         project.audioTracks.headOption.foreach { a =>
           val (start, length) = Timeline.freePlacement(
-            frame, srcLen, a.clips.map(c => (c.timelineStart, c.length)), Nil,
+            playheadRef.current, srcLen, a.clips.map(c => (c.timelineStart, c.length)), Nil,
           )
           if length > 0 then
             val p = project.updateTrack(a.id)(t => t.copy(clips = t.clips :+ PlacedClip.make(clip.id, start, length)))
@@ -1293,7 +1373,7 @@ private val App: Component[Session] = component[Session] { initial =>
     box(height = Timeline.RulerHeight)(
       row(crossAxisAlignment = CrossAxisAlignment.Stretch)(
         sizedBox(width = Timeline.LabelWidth)(box(bg = theme.surface)()),
-        box(flex = 1)(scrubCanvas((cv, size) => Timeline.paintRuler(cv, size, total, frame, theme))),
+        box(flex = 1)(scrubCanvas((cv, size) => Timeline.paintRuler(cv, size, total, playheadRef.current, theme))),
       ),
     )
 
@@ -1312,7 +1392,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // begins a drag that slides its window (the inspector's In/Out follow live); a press on the empty
   // part of any lane scrubs.
   def trackWidget(t: Timeline.Track): VNode =
-    val paint = (cv: Canvas, size: Size) => Timeline.paintTrack(cv, size, t, total, frame, theme)
+    val paint = (cv: Canvas, size: Size) => Timeline.paintTrack(cv, size, t, total, playheadRef.current, theme)
     val lane =
       t.overlays match
         case null =>
