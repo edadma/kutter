@@ -28,11 +28,13 @@ import scala.io.Source
 // placed, so lower thirds can be laid out ahead of the video — 10 seconds.
 private val DefaultTimelineFrames = 300
 
-// How far the timeline runs past its content, as a floor in frames (10 seconds) — the tail of empty
-// space that lets a clip always be slid rightward (to open a gap before it for an intro) and gives a
-// drop near the end room. The actual tail is this or half the content, whichever is larger, so even a
-// long clip has generous runway; see where `total` is computed.
-private val TimelineTailFrames = 300
+// How far the timeline runs past its content, as a floor in frames (a minute) — the tail of empty
+// space that lets a clip be slid rightward, a drop land past the end, and material be placed well
+// beyond what is already there. The actual tail is this or the whole content again, whichever is
+// larger, so runway scales with the project; it costs nothing on screen (the view has a fixed
+// scale and simply pans), and placing something in it grows the timeline further, so the runway
+// never runs out. See where `total` is computed.
+private val TimelineTailFrames = 1800
 
 // A pending confirmation: the dialog shows its title and message, and runs `action` on confirm. One
 // state drives every destructive prompt (remove a clip, clear the project), rather than a flag each.
@@ -492,7 +494,11 @@ private val App: Component[Session] = component[Session] { initial =>
   // content — projectExtent tracks a moved clip — so within a project the runway never runs out; the
   // graph itself is only sized to the content (the black base ends at `contentReach`), so the tail is
   // purely timeline headroom, not rendered frames.
-  val total    = contentReach + math.max(TimelineTailFrames, contentReach / 2)
+  val total    = contentReach + math.max(TimelineTailFrames, contentReach)
+
+  // The span the "fit" framing shows: the content plus a little margin — not the pan runway, which
+  // exists to give placements room, not to be looked at. An empty project fits its default window.
+  val fitFrames = math.max(DefaultTimelineFrames, math.round(projectExtent * 1.05).toInt)
 
   // The timeline viewport for a lane `width` wide. The scale is set exactly once — the first paint
   // fits the whole timeline to the window, the familiar opening view — and after that it changes
@@ -501,8 +507,19 @@ private val App: Component[Session] = component[Session] { initial =>
   // one width (they sit beside the same label column), so one view serves them all.
   def viewFor(width: Double): Timeline.View =
     viewWidth.current = width
-    if viewPpf.current <= 0 then viewPpf.current = width / total
-    Timeline.View(viewStart.current, viewPpf.current)
+    // A layout pass can hand the canvas a degenerate width before the panels settle; latching the
+    // fit to that would freeze a nonsense scale (a sliver-wide "whole timeline" the pan clamp then
+    // pins in place). The fit waits for a real lane and earlier paints use a throwaway scale.
+    if viewPpf.current <= 0 && width >= 100 then viewPpf.current = width / fitFrames
+    val ppf = if viewPpf.current > 0 then viewPpf.current else math.max(1e-6, width / fitFrames)
+    Timeline.View(viewStart.current, ppf)
+
+  // Forget the viewport — pan home and refit the zoom to the window on the next paint. A new or
+  // newly opened project starts from the whole-timeline view rather than inheriting the last
+  // project's framing.
+  def resetView(): Unit =
+    viewStart.current = 0.0
+    viewPpf.current   = 0.0
 
   // Keep the view's left edge on the timeline: never before frame 0, and never past the point where
   // a full window of timeline still shows (or 0 when the whole timeline fits the window).
@@ -510,23 +527,26 @@ private val App: Component[Session] = component[Session] { initial =>
     val visible = if viewPpf.current > 0 then viewWidth.current / viewPpf.current else 0.0
     viewStart.current = math.max(0.0, math.min(total - visible, viewStart.current))
 
-  // Zoom the timeline about the centre of the window: scale the pixels-per-frame, clamped between a
-  // quarter of the fit scale (a wide overview) and a frame-filling close-up, keeping the centre frame
-  // where it was so the zoom feels anchored.
-  def zoomTimeline(factor: Double): Unit =
+  // Zoom the timeline about the frame under `anchorPx`, so the spot under the cursor (or the window
+  // centre, for the buttons) stays put while the scale changes around it. The scale is clamped
+  // between a quarter of the fit scale (a wide overview) and a frame-filling close-up.
+  def zoomTimelineAt(factor: Double, anchorPx: Double): Unit =
     if viewPpf.current > 0 && viewWidth.current > 0 then
-      val centre = viewStart.current + viewWidth.current / viewPpf.current / 2
+      val anchor = viewStart.current + anchorPx / viewPpf.current
       val minPpf = viewWidth.current / total / 4
       val maxPpf = 12.0
       viewPpf.current   = math.max(minPpf, math.min(maxPpf, viewPpf.current * factor))
-      viewStart.current = centre - viewWidth.current / viewPpf.current / 2
+      viewStart.current = anchor - anchorPx / viewPpf.current
       clampViewStart()
       Repaint.request()
 
-  // Reset the view to the whole timeline fitted to the window — the opening framing.
+  // The ruler buttons' zoom: anchored on the window's centre.
+  def zoomTimeline(factor: Double): Unit = zoomTimelineAt(factor, viewWidth.current / 2)
+
+  // Reset the view to the content fitted to the window — the opening framing.
   def zoomFit(): Unit =
     if viewWidth.current > 0 then
-      viewPpf.current   = viewWidth.current / total
+      viewPpf.current   = viewWidth.current / fitFrames
       viewStart.current = 0.0
       Repaint.request()
 
@@ -545,16 +565,23 @@ private val App: Component[Session] = component[Session] { initial =>
 
   def endPan(): Unit = panning.current = false
 
-  // The wheel pans the timeline horizontally (a notch is ~40px, the step suit's scroll views use);
-  // a sideways trackpad swipe pans too. Consumed so the track stack's scroll view doesn't also act.
+  // The wheel over the timeline. Plain, it pans horizontally (a notch is ~40px, the step suit's
+  // scroll views use; a sideways trackpad swipe pans too). With the primary modifier held (Ctrl, or
+  // ⌘ on a Mac) it zooms about the cursor instead — the universal editor convention, scrolling away
+  // to zoom in. Consumed so the track stack's scroll view doesn't also act.
   def wheelPan(e: ScrollEvent): Unit =
     if viewPpf.current > 0 then
-      val d = if math.abs(e.deltaX) > math.abs(e.deltaY) then e.deltaX else e.deltaY
-      if d != 0 then
-        viewStart.current -= d * 40.0 / viewPpf.current
-        clampViewStart()
-        Repaint.request()
-        e.consume()
+      if e.ctrl || e.meta then
+        if e.deltaY != 0 then
+          zoomTimelineAt(math.pow(1.15, e.deltaY), e.localX)
+          e.consume()
+      else
+        val d = if math.abs(e.deltaX) > math.abs(e.deltaY) then e.deltaX else e.deltaY
+        if d != 0 then
+          viewStart.current -= d * 40.0 / viewPpf.current
+          clampViewStart()
+          Repaint.request()
+          e.consume()
 
   // The active monitor's length: the timeline's in the project monitor, the previewed clip's in the
   // clip monitor. The transport derives its own played fraction from this and the position it polls.
@@ -932,6 +959,7 @@ private val App: Component[Session] = component[Session] { initial =>
     setProject(Project.blank)
     setSelectedId(None)
     setPath(None)
+    resetView()
 
   // "New" — clear the project, first confirming when there are unsaved changes so work is not lost.
   def requestNew(): Unit =
@@ -1110,6 +1138,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // to the old arrangement, so re-open from scratch.
   def applyOpened(p: Project, loadedPath: String): Unit =
     dirty.current = false // freshly loaded from disk, so it matches its file
+    resetView()
     if playerRef.current != null && mediaKey(p) == mediaKey(project) then
       setProject(p)
       setSelectedId(None)
