@@ -151,7 +151,7 @@ private[kutter] object Diagnostics:
     // prints PASS/FAIL per case and exits non-zero on any failure, a regression guard runnable off the GUI.
     if sys.env.contains("KUTTER_PROBE_HIT") then
       val total = 600
-      val width = 600.0 // a 1:1 frame-to-pixel mapping keeps the expected values obvious
+      val view  = Timeline.View(0, 1.0) // a 1:1 frame-to-pixel view keeps the expected values obvious
       val a     = Timeline.OverlayBlock("a", 45, 165, "A", Color.white, false)
       val b     = Timeline.OverlayBlock("b", 230, 350, "B", Color.white, false)
       val c     = Timeline.OverlayBlock("c", 100, 140, "C", Color.white, false) // overlaps a; drawn later
@@ -161,13 +161,16 @@ private[kutter] object Diagnostics:
         if !pass then ok = false
         println(f"${if pass then "PASS" else "FAIL"}%-4s $name%-28s got=$got want=$want")
 
-      check("frameAt mid", Timeline.frameAt(100.0, total, width), 100)
-      check("frameAt clamp-low", Timeline.frameAt(-10.0, total, width), 0)
-      check("frameAt clamp-high", Timeline.frameAt(9999.0, total, width), total - 1)
-      check("overlayAt on a", Timeline.overlayAt(100.0, total, width, Seq(a, b)), Some("a"))
-      check("overlayAt on b", Timeline.overlayAt(300.0, total, width, Seq(a, b)), Some("b"))
-      check("overlayAt gap", Timeline.overlayAt(200.0, total, width, Seq(a, b)), None)
-      check("overlayAt topmost", Timeline.overlayAt(120.0, total, width, Seq(a, c)), Some("c"))
+      check("frameAt mid", Timeline.frameAt(100.0, total, view), 100)
+      check("frameAt clamp-low", Timeline.frameAt(-10.0, total, view), 0)
+      check("frameAt clamp-high", Timeline.frameAt(9999.0, total, view), total - 1)
+      // A panned/zoomed view shifts and scales the same mapping: at 2px/frame starting from frame
+      // 50, x=100 sits 50 frames past the view's start.
+      check("frameAt panned", Timeline.frameAt(100.0, total, Timeline.View(50, 2.0)), 100)
+      check("overlayAt on a", Timeline.overlayAt(100.0, view, Seq(a, b)), Some("a"))
+      check("overlayAt on b", Timeline.overlayAt(300.0, view, Seq(a, b)), Some("b"))
+      check("overlayAt gap", Timeline.overlayAt(200.0, view, Seq(a, b)), None)
+      check("overlayAt topmost", Timeline.overlayAt(120.0, view, Seq(a, c)), Some("c"))
       // dragPlacement: block in=45 out=165 (len 120), moved by a (snapped) delta and clamped.
       check("drag right", Timeline.dragPlacement(45, 120, 50, total), 95)
       check("drag left", Timeline.dragPlacement(45, 120, -40, total), 5)
@@ -181,8 +184,8 @@ private[kutter] object Diagnostics:
       // to 50; dragged +13 its end (163) is nearest 160, pulling the delta back to 10; out of reach or
       // with no targets the cursor's delta is untouched. snapEdgeDelta does the same for a trim's one
       // moving edge.
-      check("snap reach 1:1", Timeline.snapReach(total, width), 8)
-      check("snap reach floor", Timeline.snapReach(10, 9999.0), 1)
+      check("snap reach 1:1", Timeline.snapReach(view), 8)
+      check("snap reach floor", Timeline.snapReach(Timeline.View(0, 1000.0)), 1)
       check("snap start", Timeline.snapDelta(43, 100, 50, Seq(150), 8), 50)
       check("snap end", Timeline.snapDelta(13, 100, 50, Seq(160), 8), 10)
       check("snap out of reach", Timeline.snapDelta(20, 100, 50, Seq(150), 8), 20)
@@ -195,9 +198,9 @@ private[kutter] object Diagnostics:
       // press in the gap between them picks neither. This is how a press on a media lane selects a clip.
       val cb0 = Timeline.ClipBlock("c0", 0, 100, "0", false, false)
       val cb1 = Timeline.ClipBlock("c1", 150, 100, "1", false, false)
-      check("clipAt on 0", Timeline.clipAt(50.0, total, width, Seq(cb0, cb1)), Some("c0"))
-      check("clipAt on 1", Timeline.clipAt(200.0, total, width, Seq(cb0, cb1)), Some("c1"))
-      check("clipAt gap", Timeline.clipAt(125.0, total, width, Seq(cb0, cb1)), None)
+      check("clipAt on 0", Timeline.clipAt(50.0, view, Seq(cb0, cb1)), Some("c0"))
+      check("clipAt on 1", Timeline.clipAt(200.0, view, Seq(cb0, cb1)), Some("c1"))
+      check("clipAt gap", Timeline.clipAt(125.0, view, Seq(cb0, cb1)), None)
 
       // clipStartBounds: a clip of length 50 at start 100 between neighbours [0,80) and [200,260) may
       // slide only within its gap — no earlier than the previous end (80), no later than the next start
@@ -216,10 +219,10 @@ private[kutter] object Diagnostics:
       // clipEdgeAt: a press within a few pixels of a block's left/right edge picks that edge to trim; a
       // press on the body picks neither (the caller then treats it as a move). With the 1:1 mapping,
       // cb0 spans px 0..100 and cb1 spans 150..250.
-      check("edge left", Timeline.clipEdgeAt(2.0, total, width, Seq(cb0, cb1)), Some(("c0", Timeline.TrimEdge.Left)))
-      check("edge right", Timeline.clipEdgeAt(100.0, total, width, Seq(cb0, cb1)), Some(("c0", Timeline.TrimEdge.Right)))
-      check("edge body none", Timeline.clipEdgeAt(50.0, total, width, Seq(cb0, cb1)), None)
-      check("edge next left", Timeline.clipEdgeAt(150.0, total, width, Seq(cb0, cb1)), Some(("c1", Timeline.TrimEdge.Left)))
+      check("edge left", Timeline.clipEdgeAt(2.0, view, Seq(cb0, cb1)), Some(("c0", Timeline.TrimEdge.Left)))
+      check("edge right", Timeline.clipEdgeAt(100.0, view, Seq(cb0, cb1)), Some(("c0", Timeline.TrimEdge.Right)))
+      check("edge body none", Timeline.clipEdgeAt(50.0, view, Seq(cb0, cb1)), None)
+      check("edge next left", Timeline.clipEdgeAt(150.0, view, Seq(cb0, cb1)), Some(("c1", Timeline.TrimEdge.Left)))
 
       // clipTrimBounds: a placement at start 100 playing 80 frames from in-point 20 of a 200-frame
       // source, between neighbours [0,50) and [300,360). The right edge may grow to the source's end

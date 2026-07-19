@@ -63,13 +63,23 @@ object Timeline:
       overlays: Seq[OverlayBlock] | Null = null,
   )
 
-  /** The frame-count-to-x mapping for a widget `width` wide holding `total` frames. */
-  private def xOf(frame: Double, total: Int, width: Double): Double =
-    (frame / math.max(1, total)) * width
+  /** The timeline viewport: which frame sits at the widget's left edge (`start`, fractional so a
+    * pan is pixel-smooth) and how many pixels one frame occupies (`pxPerFrame`). Every frame↔x
+    * conversion goes through a View, and the scale is *fixed* — it changes only when the user zooms,
+    * never because content grew. That is the difference between an editor timeline and a squeezed
+    * overview: content wider than the window pans across it instead of everything rescaling
+    * ("scrunching") to fit. */
+  case class View(start: Double, pxPerFrame: Double):
+    /** The widget-local x where `frame` falls. */
+    def xOf(frame: Double): Double = (frame - start) * pxPerFrame
 
-  /** The inverse: the frame under widget-local x `px`, clamped. Turns a cursor position into a seek. */
-  def frameAt(px: Double, total: Int, width: Double): Int =
-    val f = math.round((px / math.max(1.0, width)) * total).toInt
+    /** The (fractional) frame under widget-local x `px`. */
+    def frameAtPx(px: Double): Double = start + px / math.max(1e-9, pxPerFrame)
+
+  /** The frame under widget-local x `px`, clamped to the timeline. Turns a cursor position into a
+    * seek. */
+  def frameAt(px: Double, total: Int, view: View): Int =
+    val f = math.round(view.frameAtPx(px)).toInt
     math.max(0, math.min(total - 1, f))
 
   /** Where a dragged title block's in-frame lands: its `origIn` shifted by the drag's (already
@@ -78,11 +88,11 @@ object Timeline:
   def dragPlacement(origIn: Int, len: Int, delta: Int, total: Int): Int =
     math.max(0, math.min(total - 1 - len, origIn + delta))
 
-  /** The magnet's reach: a fixed 8 screen pixels expressed as frames under the widget's time mapping —
-    * how close a dragged edge must come to an edit point before it sticks — and at least one frame,
-    * so the magnet still exists zoomed far in. */
-  def snapReach(total: Int, width: Double): Int =
-    math.max(1, math.round(8.0 * total / math.max(1.0, width)).toInt)
+  /** The magnet's reach: a fixed 8 screen pixels expressed as frames under the view's scale — how
+    * close a dragged edge must come to an edit point before it sticks — and at least one frame, so
+    * the magnet still exists zoomed far in. */
+  def snapReach(view: View): Int =
+    math.max(1, math.round(8.0 / math.max(1e-9, view.pxPerFrame)).toInt)
 
   /** Magnetic snapping for a sliding block, the way any editor's timeline behaves: the block follows
     * the cursor frame for frame, and when either of its edges comes within `reach` frames of one of
@@ -104,15 +114,15 @@ object Timeline:
   /** The id of the topmost overlay block under widget-local x `px`, if any — how a click on the titles
     * lane picks a lower third. Blocks are tested back-to-front so the one drawn on top wins when two
     * windows overlap. */
-  def overlayAt(px: Double, total: Int, width: Double, blocks: Seq[OverlayBlock]): Option[String] =
+  def overlayAt(px: Double, view: View, blocks: Seq[OverlayBlock]): Option[String] =
     blocks.reverseIterator
-      .find(b => px >= xOf(b.inFrame, total, width) && px <= xOf(b.outFrame, total, width))
+      .find(b => px >= view.xOf(b.inFrame) && px <= view.xOf(b.outFrame))
       .map(_.id)
 
   /** The id of the clip block under widget-local x `px`, if any — how a press on a media lane picks a
     * placed clip to select or drag. Clips on a track never overlap, so the first hit wins. */
-  def clipAt(px: Double, total: Int, width: Double, blocks: Seq[ClipBlock]): Option[String] =
-    blocks.find(b => px >= xOf(b.start, total, width) && px <= xOf(b.start + b.length, total, width)).map(_.id)
+  def clipAt(px: Double, view: View, blocks: Seq[ClipBlock]): Option[String] =
+    blocks.find(b => px >= view.xOf(b.start) && px <= view.xOf(b.start + b.length)).map(_.id)
 
   /** The lowest and highest timeline start a clip of `length` at `origStart` may take while staying in
     * its current gap between neighbours (given as (start, length) pairs, excluding this clip) and within
@@ -128,11 +138,11 @@ object Timeline:
     * right edge — how a press on a media lane picks a clip edge to trim rather than the body to move. The
     * left edge wins over the right when both are near (a very short block), and a hit is preferred to the
     * whole-body `clipAt` in the caller so the edges stay grabbable. */
-  def clipEdgeAt(px: Double, total: Int, width: Double, blocks: Seq[ClipBlock]): Option[(String, TrimEdge)] =
+  def clipEdgeAt(px: Double, view: View, blocks: Seq[ClipBlock]): Option[(String, TrimEdge)] =
     val band = 6.0
     blocks.iterator.flatMap { b =>
-      val x1 = xOf(b.start, total, width)
-      val x2 = xOf(b.start + b.length, total, width)
+      val x1 = view.xOf(b.start)
+      val x2 = view.xOf(b.start + b.length)
       if math.abs(px - x1) <= band then Some((b.id, TrimEdge.Left))
       else if math.abs(px - x2) <= band then Some((b.id, TrimEdge.Right))
       else None
@@ -195,31 +205,32 @@ object Timeline:
     if 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b > 150 then Color.black else Color.white
 
   /** Paint the ruler widget: a faint band with a tick and a centred m:ss label at a spacing that
-    * stays uncrowded on a short window, plus the playhead's grip and top line. */
-  def paintRuler(cv: Canvas, size: Size, total: Int, position: Int, theme: Theme): Unit =
+    * stays uncrowded at the view's scale, covering only the seconds the view shows, plus the
+    * playhead's grip and top line. */
+  def paintRuler(cv: Canvas, size: Size, view: View, position: Int, theme: Theme): Unit =
     val w       = size.width
     val rulerBg = if theme.isDark then Color.rgb(0x22262a) else Color.rgb(0xd0d4d8)
     cv.fillRect(Rect(0, 0, w, size.height), rulerBg)
 
-    val fps        = 30.0
-    val totalSecs  = total / fps
-    val minTickPx  = 56.0
-    val secPerPx   = totalSecs / math.max(1.0, w)
-    val step       = math.max(1, math.ceil(minTickPx * secPerPx).toInt)
+    val fps       = 30.0
+    val minTickPx = 56.0
+    val pxPerSec  = fps * view.pxPerFrame
+    val step      = math.max(1, math.ceil(minTickPx / math.max(1e-9, pxPerSec)).toInt)
     val tickInk    = theme.border
     val labelInk   = if theme.isDark then Color.rgb(0x8b9096) else Color.rgb(0x60656a)
     val labelStyle = TextStyle(11.0, labelInk)
-    var s          = 0
-    while s <= totalSecs.toInt do
-      val x     = xOf(s * fps, total, w)
+    val firstSec   = math.max(0, (math.floor(view.frameAtPx(0) / fps).toInt / step) * step)
+    val lastSec    = math.ceil(view.frameAtPx(w) / fps).toInt
+    var s          = firstSec
+    while s <= lastSec do
+      val x     = view.xOf(s * fps)
       val label = f"${s / 60}:${s % 60}%02d"
       val lw    = cv.measureText(label, labelStyle).width
-      val tx    = math.max(1.0, math.min(w - lw - 1.0, x - lw / 2))
       cv.line(Offset(x, size.height - 6), Offset(x, size.height), 1.0, tickInk)
-      cv.drawText(Offset(tx, 3), label, labelStyle)
+      cv.drawText(Offset(x - lw / 2, 3), label, labelStyle)
       s += step
 
-    val px   = xOf(position, total, w)
+    val px   = view.xOf(position)
     val head = playheadInk(theme)
     cv.fillRect(Rect(px - 0.5, 8, 1.5, size.height - 8), head)
     cv.fillPath(Path.polyline(Seq(Offset(px - 5, 0), Offset(px + 5, 0), Offset(px, 8))), head)
@@ -228,7 +239,7 @@ object Timeline:
     * where the strip is ready and a waveform for an audio clip, flat otherwise — with a bright top cap,
     * a border (ringed when selected), a link pip on a linked half, and the clip's name; then the
     * playhead line over them all. */
-  def paintTrack(cv: Canvas, size: Size, track: Track, total: Int, position: Int, theme: Theme): Unit =
+  def paintTrack(cv: Canvas, size: Size, track: Track, view: View, position: Int, theme: Theme): Unit =
     val w  = size.width
     val h  = size.height
     val bh = h - 4 // the clip block's height, inset so stacked tracks read as separate lanes
@@ -242,8 +253,8 @@ object Timeline:
     // The titles lane paints lower-third blocks instead of clips and returns early.
     val overlays = track.overlays
     if overlays != null then
-      paintOverlays(cv, overlays, total, w, bh, theme)
-      val hx = xOf(position, total, w)
+      paintOverlays(cv, overlays, view, w, bh, theme)
+      val hx = view.xOf(position)
       cv.fillRect(Rect(hx - 0.5, 0, 1.5, h), playheadInk(theme))
       return
 
@@ -251,10 +262,22 @@ object Timeline:
     val waveInk = if theme.isDark then Color.rgb(0x74c0fc) else Color.rgb(0x3b7bb8)
 
     // Each placed clip is a block from its start for its length. Blocks never overlap, so they paint
-    // independently, left to right along the lane.
+    // independently, left to right along the lane; a block wholly outside the view is skipped.
     for b <- track.clips do
-      val x1   = xOf(b.start, total, w)
-      val x2   = xOf(b.start + b.length, total, w)
+      val x1   = view.xOf(b.start)
+      val x2   = view.xOf(b.start + b.length)
+      if x2 >= 0 && x1 <= w then
+        paintClipBlock(cv, b, x1, x2, bh, w, blockCol, blockTop, audioBg, waveInk, radius, theme)
+
+    val px = view.xOf(position)
+    cv.fillRect(Rect(px - 0.5, 0, 1.5, h), playheadInk(theme))
+
+  /** Paint one clip block spanning `x1..x2` (already view-mapped; possibly partly off-screen) on a
+    * media lane: its filmstrip or waveform, cap, label scrim, link pip, and border. */
+  private def paintClipBlock(
+      cv: Canvas, b: ClipBlock, x1: Double, x2: Double, bh: Double, w: Double,
+      blockCol: Color, blockTop: Color, audioBg: Color, waveInk: Color, radius: BorderRadius, theme: Theme,
+  ): Unit =
       val bw   = math.max(2.0, x2 - x1 - 2)
       val span = math.max(1.0, x2 - x1)
       val r    = Rect(x1 + 1, 2, bw, bh)
@@ -273,8 +296,11 @@ object Timeline:
           val mid   = 2 + bh / 2
           val halfH = (bh / 2) * 0.88
           cv.fillRect(Rect(x1 + 1, mid - 0.25, bw, 0.5), waveInk) // centre line
-          var sx = x1 + 1
-          while sx < x2 - 1 do
+          // Only the visible slice of the envelope is sampled — a long clip mostly off-screen
+          // costs what its on-screen pixels cost, not its full width.
+          var sx = math.max(x1 + 1, 0.0)
+          val ex = math.min(x2 - 1, w)
+          while sx < ex do
             val hh = wf.at(srcFrac((sx - x1) / span)) * halfH
             if hh > 0.3 then cv.fillRect(Rect(sx, mid - hh, 1.3, hh * 2), waveInk)
             sx += 1.6
@@ -287,8 +313,11 @@ object Timeline:
               cv.fillRoundedRect(r, radius, blockCol)
               cv.pushClip(r, radius)
               val tw = math.max(8.0, bh * 16.0 / 9.0)
-              var sx = x1 + 1
-              while sx < x2 - 1 do
+              // Start at the first tile that reaches the view and stop past its right edge, so an
+              // off-screen stretch of filmstrip draws nothing.
+              var sx = x1 + 1 + math.max(0.0, math.floor((-(x1 + 1) - tw) / tw) + 1) * tw
+              val ex = math.min(x2 - 1, w + tw)
+              while sx < ex do
                 t.at(srcFrac((sx - x1) / span)) match
                   case img: RasterImage => cv.drawImage(img, Rect(sx, 2, tw, bh))
                   case null             => ()
@@ -314,19 +343,17 @@ object Timeline:
       if b.selected then cv.strokeRoundedRect(r, radius, theme.primary, 2.0)
       else cv.strokeRoundedRect(r, radius, theme.border, 1.0)
 
-    val px = xOf(position, total, w)
-    cv.fillRect(Rect(px - 0.5, 0, 1.5, h), playheadInk(theme))
-
   /** Paint the titles lane: each lower third as a rounded block across its in/out window, filled with
     * its style's colour and captioned with its name. The selected block is ringed in the primary
-    * colour so it reads as the inspector's subject; the others carry a plain border. */
+    * colour so it reads as the inspector's subject; the others carry a plain border. A block wholly
+    * outside the view is skipped. */
   private def paintOverlays(
-      cv: Canvas, blocks: Seq[OverlayBlock], total: Int, w: Double, bh: Double, theme: Theme,
+      cv: Canvas, blocks: Seq[OverlayBlock], view: View, w: Double, bh: Double, theme: Theme,
   ): Unit =
     val radius = BorderRadius.all(6)
-    for b <- blocks do
-      val x1 = xOf(b.inFrame, total, w)
-      val x2 = xOf(b.outFrame, total, w)
+    for b <- blocks if view.xOf(b.outFrame) >= 0 && view.xOf(b.inFrame) <= w do
+      val x1 = view.xOf(b.inFrame)
+      val x2 = view.xOf(b.outFrame)
       val bw = math.max(2.0, x2 - x1 - 2)
       val r  = Rect(x1 + 1, 2, bw, bh)
       cv.fillRoundedRect(r, radius, b.color)

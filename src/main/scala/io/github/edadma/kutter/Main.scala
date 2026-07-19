@@ -253,6 +253,19 @@ private val App: Component[Session] = component[Session] { initial =>
   val tdragSnaps = useRef[Seq[Int]](Nil)
   val tdragLast  = useRef(0)
 
+  // The timeline viewport. `viewPpf` is the zoom — pixels per frame, fixed until the user zooms (0
+  // until the first paint fits the whole timeline to the window); `viewStart` is the frame at the
+  // lanes' left edge, moved by panning; `viewWidth` remembers the lane width from the last paint so
+  // the zoom buttons and the playhead follow know the window size between paints. `panGrabX` /
+  // `panOrigStart` carry a middle-button hand-pan. Refs, not state: the painters and handlers read
+  // them imperatively — a pan or zoom repaints, never re-renders.
+  val viewStart    = useRef(0.0)
+  val viewPpf      = useRef(0.0)
+  val viewWidth    = useRef(0.0)
+  val panning      = useRef(false)
+  val panGrabX     = useRef(0.0)
+  val panOrigStart = useRef(0.0)
+
   // Advance the timeline playhead from the project player's position and ask for a repaint — but only
   // when the frame has actually moved, so a paused editor asks for no repaints and the render loop
   // stays idle. This never re-renders the editor (no state write); it drives the timeline lanes, which
@@ -267,6 +280,13 @@ private val App: Component[Session] = component[Session] { initial =>
             val pos = p.position
             if pos != playheadRef.current then
               playheadRef.current = pos
+              // Follow playback: when the playhead runs off the visible window, flip the view so it
+              // lands at the left edge and playback keeps scrolling into fresh timeline — the page
+              // scroll every editor does. Only while playing, so a paused pan is never yanked back.
+              if p.isPlaying && viewPpf.current > 0 && viewWidth.current > 0 then
+                val visible = viewWidth.current / viewPpf.current
+                if pos < viewStart.current || pos > viewStart.current + visible then
+                  viewStart.current = math.max(0.0, pos.toDouble)
               Repaint.request()
           case null => (),
     33,
@@ -473,6 +493,68 @@ private val App: Component[Session] = component[Session] { initial =>
   // graph itself is only sized to the content (the black base ends at `contentReach`), so the tail is
   // purely timeline headroom, not rendered frames.
   val total    = contentReach + math.max(TimelineTailFrames, contentReach / 2)
+
+  // The timeline viewport for a lane `width` wide. The scale is set exactly once — the first paint
+  // fits the whole timeline to the window, the familiar opening view — and after that it changes
+  // only when the user zooms. Growing content therefore never rescales the lanes under the cursor;
+  // the timeline extends past the window and the view pans across it. Every lane and the ruler share
+  // one width (they sit beside the same label column), so one view serves them all.
+  def viewFor(width: Double): Timeline.View =
+    viewWidth.current = width
+    if viewPpf.current <= 0 then viewPpf.current = width / total
+    Timeline.View(viewStart.current, viewPpf.current)
+
+  // Keep the view's left edge on the timeline: never before frame 0, and never past the point where
+  // a full window of timeline still shows (or 0 when the whole timeline fits the window).
+  def clampViewStart(): Unit =
+    val visible = if viewPpf.current > 0 then viewWidth.current / viewPpf.current else 0.0
+    viewStart.current = math.max(0.0, math.min(total - visible, viewStart.current))
+
+  // Zoom the timeline about the centre of the window: scale the pixels-per-frame, clamped between a
+  // quarter of the fit scale (a wide overview) and a frame-filling close-up, keeping the centre frame
+  // where it was so the zoom feels anchored.
+  def zoomTimeline(factor: Double): Unit =
+    if viewPpf.current > 0 && viewWidth.current > 0 then
+      val centre = viewStart.current + viewWidth.current / viewPpf.current / 2
+      val minPpf = viewWidth.current / total / 4
+      val maxPpf = 12.0
+      viewPpf.current   = math.max(minPpf, math.min(maxPpf, viewPpf.current * factor))
+      viewStart.current = centre - viewWidth.current / viewPpf.current / 2
+      clampViewStart()
+      Repaint.request()
+
+  // Reset the view to the whole timeline fitted to the window — the opening framing.
+  def zoomFit(): Unit =
+    if viewWidth.current > 0 then
+      viewPpf.current   = viewWidth.current / total
+      viewStart.current = 0.0
+      Repaint.request()
+
+  // A hand-pan: grab the timeline with the middle button anywhere on the ruler or a lane and slide
+  // the view back and forth under the cursor.
+  def beginPan(x: Double): Unit =
+    panning.current      = true
+    panGrabX.current     = x
+    panOrigStart.current = viewStart.current
+
+  def panTo(x: Double): Unit =
+    if viewPpf.current > 0 then
+      viewStart.current = panOrigStart.current - (x - panGrabX.current) / viewPpf.current
+      clampViewStart()
+      Repaint.request()
+
+  def endPan(): Unit = panning.current = false
+
+  // The wheel pans the timeline horizontally (a notch is ~40px, the step suit's scroll views use);
+  // a sideways trackpad swipe pans too. Consumed so the track stack's scroll view doesn't also act.
+  def wheelPan(e: ScrollEvent): Unit =
+    if viewPpf.current > 0 then
+      val d = if math.abs(e.deltaX) > math.abs(e.deltaY) then e.deltaX else e.deltaY
+      if d != 0 then
+        viewStart.current -= d * 40.0 / viewPpf.current
+        clampViewStart()
+        Repaint.request()
+        e.consume()
 
   // The active monitor's length: the timeline's in the project monitor, the previewed clip's in the
   // clip monitor. The transport derives its own played fraction from this and the position it polls.
@@ -1383,24 +1465,46 @@ private val App: Component[Session] = component[Session] { initial =>
   val mediaTracks = project.tracks.map(t => Timeline.Track(t.name, blocksFor(t)))
   val tracks      = mediaTracks :+ Timeline.Track("Titles", overlays = overlayBlocks)
 
-  // Scrubbing works from the ruler or any track: mousedown begins, drag seeks (the canvas captures
-  // the pointer so it tracks past the widget's edges), release ends. All widgets share the timeline
-  // width, so the same frame-under-cursor mapping serves every one.
+  // Scrubbing works from the ruler or any track: a left press begins, drag seeks (the canvas
+  // captures the pointer so it tracks past the widget's edges), release ends. A middle press
+  // hand-pans the view instead, and the wheel pans too. All widgets share the timeline width, so
+  // one view serves every one.
   def scrubCanvas(paint: (Canvas, Size) => Unit): VNode =
     canvas(
-      onMouseDown = e => beginScrub(Timeline.frameAt(e.localX, total, e.size.width)),
-      onMouseMove = e => if scrubbing.current then scrubTo(Timeline.frameAt(e.localX, total, e.size.width)),
-      onMouseUp = _ => endScrub(),
+      onMouseDown = e =>
+        if e.button == 2 then beginPan(e.localX)
+        else beginScrub(Timeline.frameAt(e.localX, total, viewFor(e.size.width))),
+      onMouseMove = e =>
+        if panning.current then panTo(e.localX)
+        else if scrubbing.current then scrubTo(Timeline.frameAt(e.localX, total, viewFor(e.size.width))),
+      onMouseUp = _ =>
+        endPan()
+        endScrub(),
+      onWheel = wheelPan,
     )(paint)
 
-  // The time ruler, pinned across the top of the track panel. Its left is a blank column the width of
-  // the track labels, so the ruler's time area starts where the track lanes do and the playhead lines
-  // up across all of them.
+  // A small zoom control for the ruler's corner: a boxed glyph that acts on press.
+  def zoomButton(glyph: String, act: () => Unit): VNode =
+    box(onClick = _ => act(), cursor = Cursor.Pointer, padding = EdgeInsets.symmetric(horizontal = 3, vertical = 0))(
+      text(glyph, size = 11, weight = FontWeight.Bold, color = theme.border),
+    )
+
+  // The time ruler, pinned across the top of the track panel. Its left is the width of the track
+  // labels and carries the zoom controls — out, fit the whole timeline, in — so the ruler's time
+  // area starts where the track lanes do and the playhead lines up across all of them.
   val ruler =
     box(height = Timeline.RulerHeight)(
       row(crossAxisAlignment = CrossAxisAlignment.Stretch)(
-        sizedBox(width = Timeline.LabelWidth)(box(bg = theme.surface)()),
-        box(flex = 1)(scrubCanvas((cv, size) => Timeline.paintRuler(cv, size, total, playheadRef.current, theme))),
+        sizedBox(width = Timeline.LabelWidth)(
+          box(bg = theme.surface)(
+            row(mainAxisAlignment = MainAxisAlignment.Center, crossAxisAlignment = CrossAxisAlignment.Center)(
+              zoomButton("−", () => zoomTimeline(1 / 1.5)),
+              zoomButton("fit", () => zoomFit()),
+              zoomButton("+", () => zoomTimeline(1.5)),
+            ),
+          ),
+        ),
+        box(flex = 1)(scrubCanvas((cv, size) => Timeline.paintRuler(cv, size, viewFor(size.width), playheadRef.current, theme))),
       ),
     )
 
@@ -1419,46 +1523,63 @@ private val App: Component[Session] = component[Session] { initial =>
   // begins a drag that slides its window (the inspector's In/Out follow live); a press on the empty
   // part of any lane scrubs.
   def trackWidget(t: Timeline.Track): VNode =
-    val paint = (cv: Canvas, size: Size) => Timeline.paintTrack(cv, size, t, total, playheadRef.current, theme)
+    val paint = (cv: Canvas, size: Size) => Timeline.paintTrack(cv, size, t, viewFor(size.width), playheadRef.current, theme)
     val lane =
       t.overlays match
         case null =>
-          // A media lane: a press near a clip's edge begins a trim, a press on its body selects it and
-          // begins a move (a linked pair does both together), a press on the empty lane scrubs. The edge
-          // is checked first so it stays grabbable even on a narrow clip.
+          // A media lane: a left press near a clip's edge begins a trim, on its body selects it and
+          // begins a move (a linked pair does both together), on the empty lane scrubs. The edge is
+          // checked first so it stays grabbable even on a narrow clip. A middle press hand-pans the
+          // view; the wheel pans too.
           canvas(
             onMouseDown = e =>
-              val f = Timeline.frameAt(e.localX, total, e.size.width)
-              Timeline.clipEdgeAt(e.localX, total, e.size.width, t.clips) match
-                case Some((id, edge)) => beginTrim(id, edge, f)
-                case None =>
-                  Timeline.clipAt(e.localX, total, e.size.width, t.clips) match
-                    case Some(id) => beginClipDrag(id, f)
-                    case None     => beginScrub(f),
+              if e.button == 2 then beginPan(e.localX)
+              else
+                val view = viewFor(e.size.width)
+                val f    = Timeline.frameAt(e.localX, total, view)
+                Timeline.clipEdgeAt(e.localX, view, t.clips) match
+                  case Some((id, edge)) => beginTrim(id, edge, f)
+                  case None =>
+                    Timeline.clipAt(e.localX, view, t.clips) match
+                      case Some(id) => beginClipDrag(id, f)
+                      case None     => beginScrub(f),
             onMouseMove = e =>
-              val f     = Timeline.frameAt(e.localX, total, e.size.width)
-              val reach = Timeline.snapReach(total, e.size.width)
-              if tdragId.current != null then dragTrim(f, reach)
-              else if cdragId.current != null then dragClip(f, reach)
-              else if scrubbing.current then scrubTo(f),
+              if panning.current then panTo(e.localX)
+              else
+                val view  = viewFor(e.size.width)
+                val f     = Timeline.frameAt(e.localX, total, view)
+                val reach = Timeline.snapReach(view)
+                if tdragId.current != null then dragTrim(f, reach)
+                else if cdragId.current != null then dragClip(f, reach)
+                else if scrubbing.current then scrubTo(f),
             onMouseUp = _ =>
+              endPan()
               endTrim()
               endClipDrag()
               endScrub(),
+            onWheel = wheelPan,
           )(paint)
         case blocks =>
           canvas(
             onMouseDown = e =>
-              Timeline.overlayAt(e.localX, total, e.size.width, blocks) match
-                case Some(id) => beginOverlayDrag(id, Timeline.frameAt(e.localX, total, e.size.width))
-                case None     => beginScrub(Timeline.frameAt(e.localX, total, e.size.width)),
+              if e.button == 2 then beginPan(e.localX)
+              else
+                val view = viewFor(e.size.width)
+                Timeline.overlayAt(e.localX, view, blocks) match
+                  case Some(id) => beginOverlayDrag(id, Timeline.frameAt(e.localX, total, view))
+                  case None     => beginScrub(Timeline.frameAt(e.localX, total, view)),
             onMouseMove = e =>
-              val f = Timeline.frameAt(e.localX, total, e.size.width)
-              if dragId.current != null then dragOverlay(f, Timeline.snapReach(total, e.size.width))
-              else if scrubbing.current then scrubTo(f),
+              if panning.current then panTo(e.localX)
+              else
+                val view = viewFor(e.size.width)
+                val f    = Timeline.frameAt(e.localX, total, view)
+                if dragId.current != null then dragOverlay(f, Timeline.snapReach(view))
+                else if scrubbing.current then scrubTo(f),
             onMouseUp = _ =>
+              endPan()
               endOverlayDrag()
               endScrub(),
+            onWheel = wheelPan,
           )(paint)
     box(height = Timeline.TrackHeight)(
       row(crossAxisAlignment = CrossAxisAlignment.Stretch)(
