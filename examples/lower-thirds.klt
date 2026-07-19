@@ -23,7 +23,7 @@ lowerThirds = [
   { name = "Typeset by",     title = "the texish engine",  in = "0:11", out = "0:14", style = texish-card }
 
   # A one-off card written entirely in texish — gold bold name over an italic line, self-contained.
-  { name = "Story", in = "0:14.5", out = "0:17.5", fade = 15, body = """
+  { name = "Story", in = "0:14.5", out = "0:16.5", fade = 15, body = """
       \use{document}
       \geometry margin:0
       \def footline {}
@@ -36,5 +36,29 @@ lowerThirds = [
       \noindent{\color{white}\font lmroman 26 {sans italic}hand-written in texish}
 
       \vskip 60pt
+  """ }
+
+  # The broadcast-caption look from texish's own lowerthird-demo: a translucent black panel filling the
+  # whole lower third of the frame (1280x240, flush to the bottom) behind a bold reference heading and a
+  # flowing paragraph of scripture. This is the panel that "takes up the whole lower third" — a fixed
+  # 1260x220pt \parbox behind a 55% \colorbox, \fboxsep 10 for a 10px inset. The heading reads \the\ltname
+  # (the row's name); the body is set as a real wrapping paragraph in EB Garamond.
+  { name = "John 3:16–17 (NLT)", in = "0:17", out = "0:20", fade = 15, body = """
+      \geometry margin:0
+      \pagecolor{transparent}
+      \vfill
+      \set fboxsep {10}
+      \colorbox[0.55]{black}{\parbox[c][220pt][t]{1260pt}{
+      \color{white}
+      \set parindent {0}
+      \font ebgaramond 30 bold
+      \the\ltname
+      \par
+      \vskip 14
+      \font ebgaramond 28 regular
+      For this is how God loved the world: He gave his one and only Son, so that everyone who
+      believes in him will not perish but have eternal life. God sent his Son into the world not
+      to judge the world, but to save the world through him.
+      }}
   """ }
 ]
