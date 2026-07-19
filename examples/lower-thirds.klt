@@ -50,7 +50,7 @@ lowerThirds = [
       \set fboxsep {10}
       // A verse number the way the usfm package sets one: a small Latin Modern sans-bold numeral
       // raised into superscript with a hair of space after it, sans whatever the prose face is.
-      \def vnum n {\raise 9pt \hbox{\font lmroman 19 {sans bold}\n}\kern 3 }
+      \def vnum n {\raise 8pt \hbox{\font lmroman 19 {sans bold}\n}\kern 3 }
       \colorbox[0.7]{black}{\parbox[c][220pt][t]{1260pt}{
       \color{white}
       \set parindent {0}
