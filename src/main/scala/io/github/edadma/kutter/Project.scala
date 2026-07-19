@@ -107,10 +107,10 @@ object Style:
     heightFrac = 0.18,
   )
 
-  /** A texish-typeset card: the name in bold sans over the title in a lighter weight, set low on the
-    * frame over a translucent bar the footage shows through. The look is the template, so this is also
-    * the worked example of a lower third expressed in texish — copy it into a project and edit the
-    * document to taste. */
+  /** A texish-typeset card: the name a bold EB Garamond heading over the title in normal weight, filling
+    * the lower third of the frame over a translucent bar the footage shows through. The look is the
+    * template, so this is also the worked example of a lower third expressed in texish — copy it into a
+    * project and edit the document to taste. */
   val texishCard = minimal.copy(
     id = "texish-card",
     label = "Texish Card",
@@ -118,28 +118,32 @@ object Style:
   )
 
   /** The default card template — core primitives only, no `\use{document}`: everything it needs
-    * (`\geometry`, `\vfill`, `\noindent`, `\colorbox`, `\parbox`, `\color`, `\font`) is built in, and the
-    * only thing the `document` package would add that a card touches is the page-number footer, which a
-    * still overlay does not want anyway. `\geometry margin:0` makes the text area fill the whole frame so
-    * the band can span the full width and sit at the bottom edge; `\vfill` pushes it down. The name and
-    * title (read from the `ltname`/`lttitle` variables) are set as flowing paragraphs — the name a bold
-    * heading, the title normal text that wraps — inside a **fixed-height** `\parbox` (180pt, content
-    * centred) behind a translucent `\colorbox`: a broadcast lower-third band, at 60% opacity, the video
-    * shows through, whose height stays put no matter how much text there is. `\fboxsep 0` keeps the band
-    * exactly the frame width; `leftskip`/`rightskip` inside inset the text from the band edges. Numbers
-    * are in points, and the card is rendered at one pixel per point, so they read directly against a
-    * 1280×720 frame. */
+    * (`\geometry`, `\pagecolor`, `\vfill`, `\colorbox`, `\parbox`, `\color`, `\font`, `\vskip`) is built
+    * in, and the only thing the `document` package would add that a card touches is the page-number
+    * footer, which a still overlay does not want anyway. This is texish's own `lowerthird-demo` adapted to
+    * kutter's data path: `\pagecolor{transparent}` leaves the page unpainted so the video shows through
+    * everywhere the template does not draw; `\geometry margin:0` lets the panel span the whole frame; and
+    * `\vfill` pushes it to the foot. The panel is a full-bleed **fixed-height** `\parbox` (1260×220pt,
+    * content top-aligned) behind a translucent `\colorbox` (55% black, the footage showing through), with
+    * `\fboxsep 10` adding 10px of padding on every side — 1260+20 wide and 220+20 tall — so the band is
+    * exactly 1280×240, one third of the 720-tall frame, flush to the bottom, its text inset 10px. The name
+    * and title (read from the `ltname`/`lttitle` variables) are set as flowing paragraphs — the name a bold
+    * EB Garamond heading, the title normal weight below it, `\par`/`\vskip 14` apart. Numbers are in points
+    * and the card is rendered at one pixel per point, so they read directly against a 1280×720 frame. */
   private def texishCardTemplate: String =
     """\geometry margin:0
       |\pagecolor{transparent}
-      |\set fboxsep {0}
       |\vfill
-      |\noindent\colorbox[0.6]{black}{\parbox[c][180pt][c]{\linewidth}{
-      |\set leftskip {56}
-      |\set rightskip {56 plus 1fil}
-      |\color{white}\font lmroman 40 {sans bold}\the\ltname
-      |
-      |\color{#c9d4e2}\font lmroman 24 {sans}\the\lttitle
+      |\set fboxsep {10}
+      |\colorbox[0.55]{black}{\parbox[c][220pt][t]{1260pt}{
+      |\color{white}
+      |\set parindent {0}
+      |\font ebgaramond 30 bold
+      |\the\ltname
+      |\par
+      |\vskip 14
+      |\font ebgaramond 28 regular
+      |\the\lttitle
       |}}
       |""".stripMargin
 
