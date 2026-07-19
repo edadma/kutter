@@ -72,11 +72,34 @@ object Timeline:
     val f = math.round((px / math.max(1.0, width)) * total).toInt
     math.max(0, math.min(total - 1, f))
 
-  /** Where a dragged title block's in-frame lands: its `origIn` shifted by how far the cursor has
-    * moved from where it grabbed (`curFrame - grabFrame`), then clamped so the whole block (length
-    * `len`) stays within `[0, total)`. Keeps the block's length and never lets it run off either end. */
-  def dragPlacement(origIn: Int, len: Int, grabFrame: Int, curFrame: Int, total: Int): Int =
-    math.max(0, math.min(total - 1 - len, origIn + (curFrame - grabFrame)))
+  /** Where a dragged title block's in-frame lands: its `origIn` shifted by the drag's (already
+    * snapped) `delta`, clamped so the whole block (length `len`) stays within `[0, total)`. Keeps the
+    * block's length and never lets it run off either end. */
+  def dragPlacement(origIn: Int, len: Int, delta: Int, total: Int): Int =
+    math.max(0, math.min(total - 1 - len, origIn + delta))
+
+  /** The magnet's reach: a fixed 8 screen pixels expressed as frames under the widget's time mapping —
+    * how close a dragged edge must come to an edit point before it sticks — and at least one frame,
+    * so the magnet still exists zoomed far in. */
+  def snapReach(total: Int, width: Double): Int =
+    math.max(1, math.round(8.0 * total / math.max(1.0, width)).toInt)
+
+  /** Magnetic snapping for a sliding block, the way any editor's timeline behaves: the block follows
+    * the cursor frame for frame, and when either of its edges comes within `reach` frames of one of
+    * the `targets` — the edit points: other clips' edges on every track, the title windows, the
+    * playhead, the timeline origin — it sticks to that point exactly. Takes the frame-accurate
+    * `delta` the cursor asks for (for a block at `origStart` of `length` frames) and returns it
+    * adjusted by the nearest such stick, or unchanged when nothing is near. */
+  def snapDelta(delta: Int, origStart: Int, length: Int, targets: Seq[Int], reach: Int): Int =
+    val start = origStart + delta
+    val fixes = targets.iterator.flatMap(t => Iterator(t - start, t - (start + length)))
+    delta + fixes.filter(f => math.abs(f) <= reach).minByOption(math.abs).getOrElse(0)
+
+  /** The same magnetism for a single sliding edge — a trim: the cursor's `delta` for an edge at
+    * `origEdge`, adjusted so the edge sticks to the nearest target within `reach`. */
+  def snapEdgeDelta(delta: Int, origEdge: Int, targets: Seq[Int], reach: Int): Int =
+    val pos = origEdge + delta
+    delta + targets.iterator.map(t => t - pos).filter(f => math.abs(f) <= reach).minByOption(math.abs).getOrElse(0)
 
   /** The id of the topmost overlay block under widget-local x `px`, if any — how a click on the titles
     * lane picks a lower third. Blocks are tested back-to-front so the one drawn on top wins when two

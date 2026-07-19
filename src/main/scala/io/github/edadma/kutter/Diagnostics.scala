@@ -168,11 +168,28 @@ private[kutter] object Diagnostics:
       check("overlayAt on b", Timeline.overlayAt(300.0, total, width, Seq(a, b)), Some("b"))
       check("overlayAt gap", Timeline.overlayAt(200.0, total, width, Seq(a, b)), None)
       check("overlayAt topmost", Timeline.overlayAt(120.0, total, width, Seq(a, c)), Some("c"))
-      // dragPlacement: block in=45 out=165 (len 120), grabbed at frame 100.
-      check("drag right", Timeline.dragPlacement(45, 120, 100, 150, total), 95)  // +50
-      check("drag left", Timeline.dragPlacement(45, 120, 100, 60, total), 5)     // -40
-      check("drag clamp-left", Timeline.dragPlacement(45, 120, 100, 0, total), 0)
-      check("drag clamp-right", Timeline.dragPlacement(45, 120, 100, 9999, total), total - 1 - 120)
+      // dragPlacement: block in=45 out=165 (len 120), moved by a (snapped) delta and clamped.
+      check("drag right", Timeline.dragPlacement(45, 120, 50, total), 95)
+      check("drag left", Timeline.dragPlacement(45, 120, -40, total), 5)
+      check("drag clamp-left", Timeline.dragPlacement(45, 120, -100, total), 0)
+      check("drag clamp-right", Timeline.dragPlacement(45, 120, 9999, total), total - 1 - 120)
+
+      // The drag magnetism. snapReach converts the fixed 8-pixel magnet to frames under the widget's
+      // mapping (1:1 here → 8 frames, and never below 1 frame). snapDelta adjusts a sliding block's
+      // delta so whichever edge lands nearest an edit point within reach sticks to it — a block at 100
+      // of length 50 dragged +43 has its start at 143, 7 short of the target 150, so the delta grows
+      // to 50; dragged +13 its end (163) is nearest 160, pulling the delta back to 10; out of reach or
+      // with no targets the cursor's delta is untouched. snapEdgeDelta does the same for a trim's one
+      // moving edge.
+      check("snap reach 1:1", Timeline.snapReach(total, width), 8)
+      check("snap reach floor", Timeline.snapReach(10, 9999.0), 1)
+      check("snap start", Timeline.snapDelta(43, 100, 50, Seq(150), 8), 50)
+      check("snap end", Timeline.snapDelta(13, 100, 50, Seq(160), 8), 10)
+      check("snap out of reach", Timeline.snapDelta(20, 100, 50, Seq(150), 8), 20)
+      check("snap no targets", Timeline.snapDelta(43, 100, 50, Nil, 8), 43)
+      check("snap nearest wins", Timeline.snapDelta(43, 100, 50, Seq(150, 146), 8), 46)
+      check("snap edge", Timeline.snapEdgeDelta(43, 100, Seq(150), 8), 50)
+      check("snap edge out of reach", Timeline.snapEdgeDelta(20, 100, Seq(150), 8), 20)
 
       // clipAt: two clips sequenced on a lane — [0,100) and [150,250). A press inside one picks it; a
       // press in the gap between them picks neither. This is how a press on a media lane selects a clip.

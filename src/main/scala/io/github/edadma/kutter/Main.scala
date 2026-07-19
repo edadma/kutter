@@ -210,40 +210,47 @@ private val App: Component[Session] = component[Session] { initial =>
   val wasPlaying = useRef(false)
 
   // Dragging a title block along the timeline. On grab we remember which lower third (`dragId`), the
-  // frame the cursor grabbed at (`dragGrab`), and the block's window at that moment (`dragIn` /
-  // `dragLen`), so each move places the block relative to the grab with no drift; `dragLastIn` skips a
-  // redundant edit when the frame under the cursor hasn't changed. `dragId == null` means no drag.
+  // frame the cursor grabbed at (`dragGrab`), the block's window at that moment (`dragIn` /
+  // `dragLen`), so each move places the block relative to the grab with no drift, and the edit points
+  // the drag's magnetism sticks to (`dragSnaps`); `dragLastIn` skips a redundant edit when the frame
+  // under the cursor hasn't changed. `dragId == null` means no drag.
   val dragId     = useRef[String | Null](null)
   val dragGrab   = useRef(0)
   val dragIn     = useRef(0)
   val dragLen    = useRef(0)
   val dragLastIn = useRef(0)
+  val dragSnaps  = useRef[Seq[Int]](Nil)
 
   // Dragging a placed clip along its track. On grab we remember the clip (`cdragId`), the frame the
   // cursor grabbed at (`cdragGrab`), and the move group — the dragged clip plus, when it is one half of
   // a linked A/V pair, its partner on the other track — as (placement id, original start) pairs
   // (`cdragGroup`), so the whole group shifts by one delta and stays locked. `cdragLo`/`cdragHi` bound
-  // that delta to what every member's track can accommodate without overlapping a neighbour; `cdragLast`
-  // skips a redundant edit when the delta hasn't changed. `cdragId == null` means no clip drag.
+  // that delta to what every member's track can accommodate without overlapping a neighbour;
+  // `cdragLen` is the dragged clip's own length and `cdragSnaps` the edit points its magnetism sticks
+  // to; `cdragLast` skips a redundant edit when the delta hasn't changed. `cdragId == null` means no
+  // clip drag.
   val cdragId    = useRef[String | Null](null)
   val cdragGrab  = useRef(0)
   val cdragGroup = useRef[List[(String, Int)]](Nil)
   val cdragLo    = useRef(0)
   val cdragHi    = useRef(0)
+  val cdragLen   = useRef(0)
+  val cdragSnaps = useRef[Seq[Int]](Nil)
   val cdragLast  = useRef(0)
 
   // Trimming a placed clip's edge. On grab we remember the clip (`tdragId`), which edge (`tdragEdge`),
   // the frame grabbed at (`tdragGrab`), and the trim group — the clip plus a linked partner — as
   // (placement id, start, in-point, length) snapshots (`tdragGroup`), so a linked pair trims by one
   // delta and stays locked. `tdragLo`/`tdragHi` bound that delta to what stays on the source and in the
-  // clip's gap (the tightest across the group); `tdragLast` skips a redundant edit. `tdragId == null`
-  // means no trim in progress.
+  // clip's gap (the tightest across the group); `tdragSnaps` holds the edit points the moving edge
+  // sticks to; `tdragLast` skips a redundant edit. `tdragId == null` means no trim in progress.
   val tdragId    = useRef[String | Null](null)
   val tdragEdge  = useRef[Timeline.TrimEdge](Timeline.TrimEdge.Right)
   val tdragGrab  = useRef(0)
   val tdragGroup = useRef[List[(String, Int, Int, Int)]](Nil)
   val tdragLo    = useRef(0)
   val tdragHi    = useRef(0)
+  val tdragSnaps = useRef[Seq[Int]](Nil)
   val tdragLast  = useRef(0)
 
   // Advance the timeline playhead from the project player's position and ask for a repaint — but only
@@ -514,8 +521,19 @@ private val App: Component[Session] = component[Session] { initial =>
         case p: Player => p.play()
         case null      => ()
 
-  // Begin dragging the title block `id`, grabbed at `grabFrame`: select it and snapshot its window so
-  // the move is relative to the grab.
+  // The edit points a drag's magnetism sticks to: every other clip's edges on every track, every
+  // other lower third's window, the playhead, and the timeline origin — the targets any NLE snaps a
+  // sliding block to. The dragged group's own blocks are excluded so a block never sticks to where it
+  // already was. Snapshotted at grab time, like the rest of the drag state.
+  def snapTargetsFor(excludeClips: Set[String], excludeLts: Set[String]): Seq[Int] =
+    val clipEdges = project.tracks.flatMap(_.clips).filterNot(c => excludeClips(c.id))
+      .flatMap(c => Seq(c.timelineStart, c.timelineEnd))
+    val ltEdges = project.lowerThirds.filterNot(lt => excludeLts(lt.id))
+      .flatMap(lt => Seq(lt.inFrame, lt.outFrame))
+    (clipEdges ++ ltEdges :+ playheadRef.current :+ 0).distinct
+
+  // Begin dragging the title block `id`, grabbed at `grabFrame`: select it and snapshot its window
+  // (and the edit points its magnetism sticks to) so the move is relative to the grab.
   def beginOverlayDrag(id: String, grabFrame: Int): Unit =
     focusProjectMonitor()
     setSelectedId(Some(id))
@@ -526,15 +544,19 @@ private val App: Component[Session] = component[Session] { initial =>
       dragIn.current     = lt.inFrame
       dragLen.current    = lt.outFrame - lt.inFrame
       dragLastIn.current = lt.inFrame
+      dragSnaps.current  = snapTargetsFor(Set.empty, Set(id))
     }
 
-  // Continue a title drag: shift the block by how far the cursor has moved from the grab, keeping its
-  // length and clamping the whole block within the timeline. Only edits when the target frame changes,
-  // so a press that doesn't move stays a plain selection and drives no graph rebuild.
-  def dragOverlay(curFrame: Int): Unit =
+  // Continue a title drag: follow the cursor frame for frame from the grab — sticking to a nearby
+  // edit point when either edge comes within the magnet's reach — keeping the block's length and
+  // clamping it within the timeline. Only edits when the target frame changes, so a press that
+  // doesn't move stays a plain selection and drives no graph rebuild.
+  def dragOverlay(curFrame: Int, reach: Int): Unit =
     dragId.current match
       case id: String =>
-        val newIn = Timeline.dragPlacement(dragIn.current, dragLen.current, dragGrab.current, curFrame, total)
+        val want    = curFrame - dragGrab.current
+        val snapped = Timeline.snapDelta(want, dragIn.current, dragLen.current, dragSnaps.current, reach)
+        val newIn   = Timeline.dragPlacement(dragIn.current, dragLen.current, snapped, total)
         if newIn != dragLastIn.current then
           dragLastIn.current = newIn
           editLt(id, _.copy(inFrame = newIn, outFrame = newIn + dragLen.current))
@@ -583,19 +605,23 @@ private val App: Component[Session] = component[Session] { initial =>
       cdragGroup.current = group.map { case (_, pc) => (pc.id, pc.timelineStart) }
       cdragLo.current    = lo
       cdragHi.current    = hi
+      cdragLen.current   = group.find(_._2.id == id).map(_._2.length).getOrElse(0)
+      cdragSnaps.current = snapTargetsFor(ids, Set.empty)
       cdragLast.current  = 0
 
-  // Continue a clip drag: shift the whole group by the cursor's travel from the grab, snapped so the
-  // dragged clip's start lands on a half-second boundary (so a fixed-length title fits exactly before
-  // it), clamped to the group's feasible delta, and move every member together. Only edits when the
-  // delta changes, so a press that doesn't move drives no rebuild.
-  def dragClip(curFrame: Int): Unit =
+  // Continue a clip drag: shift the whole group by the cursor's travel from the grab, frame for
+  // frame — sticking to a nearby edit point (a neighbouring clip's edge on any track, a title
+  // window, the playhead) when either edge of the dragged clip comes within the magnet's reach —
+  // clamped to the group's feasible delta, and move every member together. Only edits when the delta
+  // changes, so a press that doesn't move drives no rebuild.
+  def dragClip(curFrame: Int, reach: Int): Unit =
     cdragId.current match
       case id: String =>
         val want  = curFrame - cdragGrab.current
-        val snap  = math.max(1, math.round(fps / 2).toInt) // frames in a half second
         val orig  = cdragGroup.current.find(_._1 == id).map(_._2).getOrElse(0)
-        val snapped = math.round((orig + want).toDouble / snap).toInt * snap - orig
+        // Until the cursor has actually traveled, don't let the magnet move anything — a press that
+        // merely selects must not nudge a clip resting near an edit point.
+        val snapped = if want == 0 then 0 else Timeline.snapDelta(want, orig, cdragLen.current, cdragSnaps.current, reach)
         val delta = math.max(cdragLo.current, math.min(cdragHi.current, snapped))
         if delta != cdragLast.current then
           cdragLast.current = delta
@@ -644,24 +670,25 @@ private val App: Component[Session] = component[Session] { initial =>
       tdragGroup.current = group.map { case (_, pc) => (pc.id, pc.timelineStart, pc.inPoint, pc.length) }
       tdragLo.current    = lo
       tdragHi.current    = hi
+      tdragSnaps.current = snapTargetsFor(group.map(_._2.id).toSet, Set.empty)
       tdragLast.current  = 0
 
-  // Continue a trim: move the grabbed edge by the cursor's travel from the grab, snapped so the edge
-  // lands on a half-second boundary (to trim to a round duration), clamped to the group's feasible
-  // delta, and apply it to every member — a right-edge trim changes the length, a left-edge trim moves
-  // the in-point and start together (shortening from the head). Only edits when the delta changes.
-  def dragTrim(curFrame: Int): Unit =
+  // Continue a trim: move the grabbed edge by the cursor's travel from the grab, frame for frame —
+  // sticking to a nearby edit point when the edge comes within the magnet's reach — clamped to the
+  // group's feasible delta, and apply it to every member — a right-edge trim changes the length, a
+  // left-edge trim moves the in-point and start together (shortening from the head). Only edits when
+  // the delta changes.
+  def dragTrim(curFrame: Int, reach: Int): Unit =
     tdragId.current match
       case id: String =>
         val want = curFrame - tdragGrab.current
-        val snap = math.max(1, math.round(fps / 2).toInt)
         val edge = tdragEdge.current
         val origEdge = tdragGroup.current.find(_._1 == id) match
           case Some((_, s, _, l)) => edge match
               case Timeline.TrimEdge.Right => s + l
               case Timeline.TrimEdge.Left  => s
           case None => 0
-        val snapped = math.round((origEdge + want).toDouble / snap).toInt * snap - origEdge
+        val snapped = Timeline.snapEdgeDelta(want, origEdge, tdragSnaps.current, reach)
         val delta   = math.max(tdragLo.current, math.min(tdragHi.current, snapped))
         if delta != tdragLast.current then
           tdragLast.current = delta
@@ -1409,9 +1436,10 @@ private val App: Component[Session] = component[Session] { initial =>
                     case Some(id) => beginClipDrag(id, f)
                     case None     => beginScrub(f),
             onMouseMove = e =>
-              val f = Timeline.frameAt(e.localX, total, e.size.width)
-              if tdragId.current != null then dragTrim(f)
-              else if cdragId.current != null then dragClip(f)
+              val f     = Timeline.frameAt(e.localX, total, e.size.width)
+              val reach = Timeline.snapReach(total, e.size.width)
+              if tdragId.current != null then dragTrim(f, reach)
+              else if cdragId.current != null then dragClip(f, reach)
               else if scrubbing.current then scrubTo(f),
             onMouseUp = _ =>
               endTrim()
@@ -1426,7 +1454,7 @@ private val App: Component[Session] = component[Session] { initial =>
                 case None     => beginScrub(Timeline.frameAt(e.localX, total, e.size.width)),
             onMouseMove = e =>
               val f = Timeline.frameAt(e.localX, total, e.size.width)
-              if dragId.current != null then dragOverlay(f)
+              if dragId.current != null then dragOverlay(f, Timeline.snapReach(total, e.size.width))
               else if scrubbing.current then scrubTo(f),
             onMouseUp = _ =>
               endOverlayDrag()
