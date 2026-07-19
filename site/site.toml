@@ -1,0 +1,217 @@
+# kutter.video — the product site for the kutter video editor.
+# Built with juicer + a vendored copy of the juicerlanding theme
+# (themes/juicerlanding, which inherits themes/juicercommon).
+#
+# The home page is assembled entirely from the section blocks below;
+# content/_index.md carries only `layout: home`. Omit a block and its
+# section is silently dropped. Trust logos, pricing tiers, and
+# testimonials are intentionally omitted — kutter is a young,
+# free/open-source project with none of those yet.
+#
+# Local preview:
+#   sbt 'juicerJVM/run serve -s site -L'   # from the kutter-site worktree
+
+title       = "kutter"
+tagline     = "A video editor built for typeset lower thirds."
+author      = "Ed Maxedon"
+baseURL     = "https://kutter.video"
+description = "kutter is an open-source, fixed-track video editor built for automated typeset lower thirds — a batch of name/title cards typeset by texish and faded over your footage."
+
+themeDir = "themes"
+theme    = "juicerlanding"
+
+htmlDir = ""
+sortBy  = "date"
+
+repoURL = "https://github.com/edadma/kutter"
+
+[organization]
+name   = "kutter"
+sameAs = ["https://github.com/edadma/kutter"]
+
+# Topbar CTA — surfaced on every page.
+[topbarCta]
+label = "View on GitHub"
+url   = "https://github.com/edadma/kutter"
+
+[[topnav]]
+label = "Features"
+url   = "#features"
+
+[[topnav]]
+label = "How it works"
+url   = "#showcase"
+
+[[topnav]]
+label = "GitHub"
+url   = "https://github.com/edadma/kutter"
+
+# ============================================================
+# Hero
+# ============================================================
+[hero]
+eyebrow      = "open source · Scala Native"
+headline     = "A video editor built for typeset lower thirds."
+subheadline  = "kutter is a fixed-track NLE in the shape of kdenlive or Resolve — but its reason for being is automated, typeset lower thirds: a batch of name/title cards, set by the texish engine, faded in and out over your footage."
+codeLang     = "bash"
+codeSnippet  = """# open an empty project, or drop a clip straight onto V1
+sbt run
+sbt "run clip.mp4"
+sbt "run project.kutter\""""
+
+[hero.primaryCta]
+label = "View on GitHub"
+url   = "https://github.com/edadma/kutter"
+
+[hero.secondaryCta]
+label = "See how it works"
+url   = "#showcase"
+
+# ============================================================
+# Features
+# ============================================================
+[featuresHead]
+title = "A real timeline, pointed at one job"
+body  = "Everything a fixed-track editor needs to sequence footage — and a lower-thirds layer riding on top of it, typeset instead of hand-drawn."
+
+[[features]]
+icon  = "🎬"
+title = "Fixed-track NLE"
+body  = "Import media into a bin, then place it on tracks — V1/V2 composited top-down, A1/A2 mixed. The whole stack compiles to an MLT tractor for playback and export."
+
+[[features]]
+icon  = "🔤"
+title = "Typeset lower thirds"
+body  = "Name/title cards are set by the texish engine, not drawn by hand. Import a batch from a .klt list or add them one at a time; each rides its own layer over the footage, faded in and out."
+
+[[features]]
+icon  = "🔊"
+title = "Audio is the master clock"
+body  = "Each MLT frame carries picture and sound, decoded on its own thread. The decode thread holds every picture until the device has played its audio, so video follows sound instead of drifting off a wall clock."
+
+[[features]]
+icon  = "🧵"
+title = "Off the UI thread"
+body  = "The per-frame cost lives where it belongs — off the UI thread. Decoded YUV planes are handed to a video widget and uploaded to a texture; the renderer does YUV→RGB in the blit's shader, no CPU conversion."
+
+[[features]]
+icon  = "🖥️"
+title = "Dual monitors"
+body  = "A clip monitor beside the project monitor, the way an editor expects — preview a bin clip and the sequenced timeline side by side."
+
+[[features]]
+icon  = "🦀"
+title = "One native binary"
+body  = "The whole app is a single Scala Native binary over the suit UI toolkit, decoding through MLT and playing audio through SDL3. No runtime, no bundler."
+
+# ============================================================
+# Code section — how the lower-thirds batch is driven
+# ============================================================
+[code]
+title   = "Batch your lower thirds, don't draw them"
+body    = "Point kutter at a list of name/title cards and it typesets each one through texish and lays it on the lower-thirds layer, timed over the footage. Add or nudge them by hand afterward."
+lang    = "bash"
+bullets = [
+  "A .klt list is a batch of cards — name, title, and where each sits on the timeline",
+  "Each card is typeset by texish, so type looks set, not drawn",
+  "Cards ride their own layer over the track stack — reposition or re-time live",
+]
+snippet = """# a project opens with its lower-thirds layer ready
+sbt "run interview.mp4"
+
+# then import a batch, or add cards by hand in the timeline
+# examples/lower-thirds.klt  ->  typeset + placed over V1"""
+
+# ============================================================
+# Screenshot showcase
+# ============================================================
+[showcase]
+title   = "The timeline you'd expect"
+body    = "A bin, a track stack, dual monitors, and a lower-thirds layer on top — sequenced along one timeline and compiled to an MLT graph for playback. This is a live render straight out of the editor."
+image   = "/img/screenshots/editor.png"
+alt     = "The kutter editor: bin, V1/V2 and A1/A2 tracks, dual monitors, and a lower-thirds layer"
+caption = "A frame rendered by kutter's off-GUI diagnostics path."
+reverse = true
+
+# ============================================================
+# FAQ
+# ============================================================
+[faqHead]
+title = "Frequently asked"
+body  = "kutter is early and moving fast — this is where it stands today."
+
+[[faqs]]
+open = true
+q    = "What is kutter for?"
+a    = "Automated, typeset lower thirds. It's a full fixed-track editor, but the thing it's built to do well is take a batch of name/title cards, typeset them with the texish engine, and fade them over footage — the kind of thing you'd otherwise redraw by hand for every clip."
+
+[[faqs]]
+q = "Is it ready to use?"
+a = "It's early and open source, under active development. The timeline, bin, tracks, dual monitors, and audio-mastered playback all work; a lot is still moving. Follow along or contribute on GitHub."
+
+[[faqs]]
+q = "What does it run on?"
+a = "kutter is a single Scala Native binary. It links against Homebrew MLT (libmlt-7), SDL3, cairo, freetype, and librsvg — the shared libraries the bindings use. Development is on macOS today."
+
+[[faqs]]
+q = "How are the lower thirds typeset?"
+a = "Through texish, a TeX-style typesetting engine. Cards are set as real type rather than drawn as bitmaps, so name/title lower thirds come out crisp and consistent across a whole batch."
+
+[[faqs]]
+q = "Is it free?"
+a = "Yes — kutter is open source. The full source is on GitHub."
+
+# ============================================================
+# Final CTA
+# ============================================================
+[finalCta]
+title = "Cut your first lower third."
+body  = "kutter is open source and moving fast. Clone it, build it, and put typeset name cards over your footage."
+
+[finalCta.primaryCta]
+label = "View on GitHub"
+url   = "https://github.com/edadma/kutter"
+
+[finalCta.secondaryCta]
+label = "Read the README"
+url   = "https://github.com/edadma/kutter#readme"
+
+# ============================================================
+# Footer
+# ============================================================
+[[footerColumns]]
+title = "Project"
+
+[[footerColumns.links]]
+label = "Features"
+url   = "#features"
+
+[[footerColumns.links]]
+label = "How it works"
+url   = "#showcase"
+
+[[footerColumns.links]]
+label = "GitHub"
+url   = "https://github.com/edadma/kutter"
+
+[[footerColumns]]
+title = "Built on"
+
+[[footerColumns.links]]
+label = "texish"
+url   = "https://github.com/edadma/texish"
+
+[[footerColumns.links]]
+label = "MLT framework"
+url   = "https://www.mltframework.org"
+
+[[footerColumns.links]]
+label = "SDL3"
+url   = "https://github.com/edadma/sdl3"
+
+# Per-site palette overrides (juicerlanding defaults: slate / indigo / amber).
+# We'll retune these for a dark, cinematic look during the restyle pass.
+#
+# [juicerlanding]
+# brand  = "#..."
+# accent = "#..."
