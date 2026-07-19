@@ -108,32 +108,39 @@ object Style:
   )
 
   /** A texish-typeset card: the name in bold sans over the title in a lighter weight, set low on the
-    * frame with real kerning and no bar. The look is the template, so this is also the worked example
-    * of a lower third expressed in texish — copy it into a project and edit the document to taste. */
+    * frame over a translucent bar the footage shows through. The look is the template, so this is also
+    * the worked example of a lower third expressed in texish — copy it into a project and edit the
+    * document to taste. */
   val texishCard = minimal.copy(
     id = "texish-card",
     label = "Texish Card",
     texish = Some(texishCardTemplate),
   )
 
-  /** The default card template. It pulls in the `document` macros, makes the text area fill the whole
-    * frame (`\geometry margin:0`, so the words can sit right at the bottom edge), drops the page-number
-    * footer (a still overlay wants no folio), pushes the words down with `\vfill`, and sets the name and
-    * title read from the `ltname`/`lttitle` variables. Numbers are in points, and the card is rendered
-    * at one pixel per point, so they read directly against a 1280×720 frame. */
+  /** The default card template — core primitives only, no `\use{document}`: everything it needs
+    * (`\geometry`, `\vfill`, `\noindent`, `\colorbox`, `\parbox`, `\color`, `\font`) is built in, and the
+    * only thing the `document` package would add that a card touches is the page-number footer, which a
+    * still overlay does not want anyway. `\geometry margin:0` makes the text area fill the whole frame so
+    * the band can span the full width and sit at the bottom edge; `\vfill` pushes it down. The name and
+    * title (read from the `ltname`/`lttitle` variables) are set as flowing paragraphs — the name a bold
+    * heading, the title normal text that wraps — inside a **fixed-height** `\parbox` (180pt, content
+    * centred) behind a translucent `\colorbox`: a broadcast lower-third band, at 60% opacity, the video
+    * shows through, whose height stays put no matter how much text there is. `\fboxsep 0` keeps the band
+    * exactly the frame width; `leftskip`/`rightskip` inside inset the text from the band edges. Numbers
+    * are in points, and the card is rendered at one pixel per point, so they read directly against a
+    * 1280×720 frame. */
   private def texishCardTemplate: String =
-    """\use{document}
-      |\geometry margin:0
-      |\def footline {}
-      |\set leftskip {56}
+    """\geometry margin:0
+      |\pagecolor{transparent}
+      |\set fboxsep {0}
       |\vfill
-      |\noindent{\color{white}\font lmroman 48 {sans bold}\the\ltname}
+      |\noindent\colorbox[0.6]{black}{\parbox[c][180pt][c]{\linewidth}{
+      |\set leftskip {56}
+      |\set rightskip {56 plus 1fil}
+      |\color{white}\font lmroman 40 {sans bold}\the\ltname
       |
-      |\vskip 8pt
-      |
-      |\noindent{\color{#c9d4e2}\font lmroman 30 {sans}\the\lttitle}
-      |
-      |\vskip 64pt
+      |\color{#c9d4e2}\font lmroman 24 {sans}\the\lttitle
+      |}}
       |""".stripMargin
 
   /** The styles a new project starts with. */

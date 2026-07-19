@@ -361,6 +361,22 @@ private[kutter] object Diagnostics:
       println("black-base render wrote probe-black.png")
       return true
 
+    // `KUTTER_PROBE_CARD` renders the texish-card style — whose template paints a translucent
+    // `\colorbox` bar behind the name/title — first to its own transparent PNG, then composited over
+    // real footage to probe-card.png. It checks that a translucent colour paints through kutter's ARGB
+    // `CairoImageTypesetter` path (not just the CLI's PDF backend) and that the shipped template renders
+    // without error, which is the point of a texish lower third with a background.
+    if sys.env.contains("KUTTER_PROBE_CARD") then
+      val card = LowerThird("card", "Jane Smith", "CEO, Acme", 0, 90, styleId = "texish-card")
+      val out  = CardRenderer.renderCard(card, Style.texishCard, 1280, 720)
+      println(s"texish-card wrote $out")
+      // Composite the same card over real footage so the translucency reads over a picture, not gray.
+      Mlt.init()
+      Player.probe(videoProject("big_buck_bunny_720p.mp4").copy(lowerThirds = List(card)), 45, "probe-card.png")
+      Mlt.close()
+      println("texish-card over video wrote probe-card.png")
+      return true
+
     // `KUTTER_PROBE_NLE` renders the fullest fixed-track shape the model compiles — a video track with
     // two clips sequenced along it (a gap between them shows the black base through), an audio track
     // mixed in, and a lower third on top — to a PNG. It checks that a track's playlist sequences its
