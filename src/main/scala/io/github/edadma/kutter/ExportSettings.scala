@@ -115,12 +115,21 @@ final case class ExportSettings(
   private def audioQualityProps: List[(String, String)] =
     if audio.lossless then Nil else List("ab" -> s"${audioBitrateK}k")
 
+  // Whether this is HEVC in an Apple container. libx265 tags its stream `hev1` by default, which Apple's
+  // players (QuickTime, Photos, Safari, Finder) refuse to decode — the file opens playing audio only,
+  // though the picture is intact. Forcing the equivalent `hvc1` tag makes the same bitstream play there.
+  private def appleHevc: Boolean =
+    video == VideoCodec.H265 && (container == Container.Mp4 || container == Container.Mov)
+
   /** The avformat consumer properties this configuration compiles to — the muxer format, the two codecs,
-    * the quality settings, and (for MP4/MOV) a web-friendly moov-at-front flag. Audio rate and channels
-    * are set by the caller from the timeline spec, so they are not here. Pure, so it is unit-tested. */
+    * the quality settings, an `hvc1` tag for HEVC in an Apple container (so QuickTime plays the video, not
+    * just the audio), and (for MP4/MOV) a web-friendly moov-at-front flag. Audio rate and channels are set
+    * by the caller from the timeline spec, so they are not here. Pure, so it is unit-tested. */
   def consumerProps: List[(String, String)] =
     List("f" -> container.muxer, "vcodec" -> video.id, "acodec" -> audio.id) ++
-      videoQualityProps ++ audioQualityProps ++
+      videoQualityProps ++
+      (if appleHevc then List("vtag" -> "hvc1") else Nil) ++
+      audioQualityProps ++
       (if container == Container.Mp4 || container == Container.Mov then List("movflags" -> "+faststart") else Nil)
 
 object ExportSettings:

@@ -748,6 +748,9 @@ object Player:
     val consumer = Consumer(profile, "avformat", Some(out))
     consumer.realTime         = 0    // encode as fast as the machine allows, dropping nothing
     consumer.terminateOnPause = true // stop when the base track's speed hits 0 (the timeline's end)
+    LoggerFactory.getLogger.info(
+      s"export → $out : valid=${settings.isValid} " + settings.consumerProps.map((k, v) => s"$k=$v").mkString(" "),
+      category = "player")
     for (k, v) <- settings.consumerProps do consumer.set(k, v)
     consumer.set("frequency", project.spec.audioRate.toString)
     consumer.set("channels", AudioChannels.toString)

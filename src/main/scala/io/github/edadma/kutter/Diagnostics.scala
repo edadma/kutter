@@ -535,6 +535,12 @@ private[kutter] object Diagnostics:
       check("props prores profile", ExportSettings(Container.Mov, VideoCodec.ProRes, AudioCodec.PCM, false, 20, 8000, 192).consumerProps.toMap.get("vprofile"), Some("3"))
       val brProps = ExportSettings.default.copy(useCrf = false).consumerProps.toMap
       check("props bitrate mode vb", (brProps.get("vb"), brProps.get("crf")), (Some("8000k"), None))
+      // HEVC in an Apple container gets the hvc1 tag so QuickTime plays the picture (hev1 plays audio
+      // only); HEVC in MKV, or H.264 in MP4, does not.
+      check("props mp4 h265 hvc1", ExportSettings(Container.Mp4, VideoCodec.H265, AudioCodec.AAC, true, 24, 8000, 192).consumerProps.toMap.get("vtag"), Some("hvc1"))
+      check("props mov h265 hvc1", ExportSettings(Container.Mov, VideoCodec.H265, AudioCodec.AAC, true, 24, 8000, 192).consumerProps.toMap.get("vtag"), Some("hvc1"))
+      check("props mkv h265 no tag", ExportSettings(Container.Mkv, VideoCodec.H265, AudioCodec.MP3, true, 24, 8000, 192).consumerProps.toMap.get("vtag"), None)
+      check("props mp4 h264 no tag", ExportSettings.default.consumerProps.toMap.get("vtag"), None)
 
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
@@ -667,6 +673,7 @@ private[kutter] object Diagnostics:
         ES(Container.WebM, VideoCodec.VP9,    AudioCodec.Opus, useCrf = true,  crf = 32, 8000, 128),  // WebM VP9/Opus, CRF (vb=0)
         ES(Container.Mov,  VideoCodec.ProRes, AudioCodec.PCM,  useCrf = false, crf = 20, 8000, 192),  // MOV  ProRes/PCM, profile + lossless
         ES(Container.Mkv,  VideoCodec.H265,   AudioCodec.MP3,  useCrf = true,  crf = 24, 8000, 192),  // MKV  H.265/MP3, CRF
+        ES(Container.Mp4,  VideoCodec.H265,   AudioCodec.AAC,  useCrf = true,  crf = 24, 8000, 192),  // MP4  H.265/AAC, CRF + hvc1 tag (QuickTime)
         ES(Container.Avi,  VideoCodec.MPEG4,  AudioCodec.MP3,  useCrf = false, crf = 20, 6000, 192),  // AVI  MPEG-4/MP3, bitrate
         ES(Container.Wmv,  VideoCodec.WMV2,   AudioCodec.WMA,  useCrf = false, crf = 20, 6000, 128),  // WMV  WMV2/WMA (asf), bitrate
       )
