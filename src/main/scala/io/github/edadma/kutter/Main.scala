@@ -149,7 +149,7 @@ private val App: Component[Session] = component[Session] { initial =>
             exportJob.current = null
             setExporting(false)
             setExportProgress(1.0)
-            setConfirm(Some(ConfirmSpec("Export complete", s"Wrote ${exportOut.current}.", "OK", () => ())))
+            setConfirm(Some(ConfirmSpec("Export complete", s"Wrote ${exportOut.current}.", "OK", () => (), notice = true)))
           else setExportProgress(job.position.toDouble / math.max(1, job.totalFrames))
         case null => (),
     200,
@@ -592,7 +592,7 @@ private val App: Component[Session] = component[Session] { initial =>
   def requestExport(): Unit =
     if !hasContent(project) then
       setConfirm(Some(ConfirmSpec("Nothing to export",
-        "Place some media or a title on the timeline before exporting a video.", "OK", () => ())))
+        "Place some media or a title on the timeline before exporting a video.", "OK", () => (), notice = true)))
     else setExportSettingsOpen(true)
 
   // Proceed from the settings dialog to a save dialog for the path, then the encode — using the chosen
@@ -629,7 +629,7 @@ private val App: Component[Session] = component[Session] { initial =>
       setExporting(true)
     catch
       case e: Throwable =>
-        setConfirm(Some(ConfirmSpec("Export failed", Option(e.getMessage).getOrElse(e.toString), "OK", () => ())))
+        setConfirm(Some(ConfirmSpec("Export failed", Option(e.getMessage).getOrElse(e.toString), "OK", () => (), notice = true)))
 
   // Cancel a running export: stop and free the job (leaving whatever was written so far on disk).
   def cancelExport(): Unit =

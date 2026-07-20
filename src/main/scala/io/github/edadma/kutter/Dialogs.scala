@@ -15,7 +15,10 @@ private[kutter] final case class SettingsDraft(name: String, created: String, sp
 
 // A pending confirmation: the dialog shows its title and message, and runs `action` on confirm. One
 // `App` state drives every destructive prompt (remove a clip, clear the project), rather than a flag each.
-private[kutter] final case class ConfirmSpec(title: String, message: String, confirmLabel: String, action: () => Unit)
+// `notice` marks an informational prompt — a completion or error message whose only action is to dismiss —
+// so the dialog drops the redundant Cancel button and shows just the acknowledge button.
+private[kutter] final case class ConfirmSpec(
+    title: String, message: String, confirmLabel: String, action: () => Unit, notice: Boolean = false)
 
 /** The confirmation modal, shown while a `ConfirmSpec` is pending. Cancel or the scrim dismisses it;
   * the action button runs the pending action. One dialog serves every destructive prompt. */
@@ -23,9 +26,13 @@ private final case class ConfirmProps(spec: Option[ConfirmSpec], onDismiss: () =
 
 private val ConfirmDialog: Component[ConfirmProps] = component[ConfirmProps] { p =>
   val theme = useTheme()
-  val (title, msg, label, action) = p.spec match
-    case Some(s) => (s.title, s.message, s.confirmLabel, s.action)
-    case None    => ("", "", "OK", () => ())
+  val (title, msg, label, action, notice) = p.spec match
+    case Some(s) => (s.title, s.message, s.confirmLabel, s.action, s.notice)
+    case None    => ("", "", "OK", () => (), false)
+  // A notice needs only an acknowledge button; a real confirmation also offers Cancel.
+  val buttons =
+    (if notice then Seq.empty else Seq(KutterUi.textButton(theme)("Cancel", p.onDismiss))) :+
+      KutterUi.textButton(theme)(label, () => { p.onDismiss(); action() })
   Dialog(open = p.spec.isDefined, onClose = p.onDismiss, width = 380)(
     // A fixed inner width so the message wraps (the dialog does not constrain its content on its own).
     sizedBox(width = 336)(
@@ -33,9 +40,7 @@ private val ConfirmDialog: Component[ConfirmProps] = component[ConfirmProps] { p
         text(title, size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
         text(msg, size = 13, color = theme.border, maxLines = 0),
         row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
-          spacer(),
-          KutterUi.textButton(theme)("Cancel", p.onDismiss),
-          KutterUi.textButton(theme)(label, () => { p.onDismiss(); action() }),
+          (spacer() +: buttons)*,
         ),
       ),
     ),

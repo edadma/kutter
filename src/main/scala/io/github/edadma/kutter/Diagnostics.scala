@@ -684,6 +684,25 @@ private[kutter] object Diagnostics:
         val ok   = done && f.exists() && size >= 1024
         if !ok then allOk = false
         println(f"${if ok then "OK  " else "FAIL"} ${s.container.label}%-20s ${s.video.label}%-16s ${s.audio.label}%-20s -> ${size} bytes")
+
+      // A title on a video track with audio but NO footage — the titles-only case — must still export a
+      // real video stream (black base + the card), not audio alone. Encoded to its own mp4 for inspection.
+      val aud2   = MediaClip.make(src, MediaKind.Audio, len)
+      val titled = withTitles(
+        Project.blank.withSpec(spec).copy(
+          bin = List(aud2),
+          tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(aud2.id, 0, len)))),
+        ),
+        List((LowerThird("t", "Titles only", "no footage"), 0, math.max(1, len - 1))),
+      )
+      val tout = s"$dir/probe-export-titles.mp4"
+      new File(tout).delete()
+      val tjob = Player.startRender(titled, tout, ES.default)
+      var tw = 0
+      while !tjob.isDone && tw < 60000 do Thread.sleep(50); tw += 50
+      tjob.finish()
+      println(f"OK   titles+audio (no footage) -> ${new File(tout).length()} bytes @ $tout")
+
       Mlt.close()
       println(if allOk then "EXPORT PROBE OK" else "EXPORT PROBE FAILED")
       if !allOk then sys.exit(1)
