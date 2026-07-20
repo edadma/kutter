@@ -129,6 +129,30 @@ object Multicam:
       .updateTrack(programTrackId)(t => t.copy(clips = t.clips ++ cuts))
       .updateTrack(audioTrackId)(t => t.copy(clips = t.clips ++ bed))
 
+  /** Build a whole multicam program from a set of bin video clips and their audio envelopes, ready to add
+    * to a project: the group (its first clip the audio bed, the rest synced to it), a dedicated video track
+    * holding the opening program cut, and a dedicated audio track holding the continuous bed. `length` is
+    * the program's frame span (the bed clip's length). Cameras go on their own tracks rather than the
+    * shared V1/A1 so the switched program is self-contained. Envelopes are looked up by clip path; a clip
+    * with none stays at offset 0 (the user nudges). */
+  def buildProgram(clips: List[MediaClip], envelopes: Map[String, Array[Float]], maxLag: Int, length: Int): (Multicam, Track, Track) =
+    val sources = clips.map(c => (c.id, c.name, envelopes.getOrElse(c.path, Array.empty[Float])))
+    val group   = make("Multicam", syncedAngles(sources, bedIdx = 0, maxLag = maxLag), audioAngle = 0)
+    val videoTrack = Track(s"mcv-${System.nanoTime()}", "MC", MediaKind.Video, initialProgram(group, 0, length, 0))
+    val audioTrack = Track(s"mca-${System.nanoTime()}", "MC ♪", MediaKind.Audio, audioBed(group, 0, length).toList)
+    (group, videoTrack, audioTrack)
+
+  /** Append a title-slide `angle` to the group `mcId`, so the program can cut to it. The program picture is
+    * unchanged until a switch selects it, so this needs no re-cut. */
+  def addTitle(project: Project, mcId: String, angle: Angle): Project =
+    project.copy(multicams = project.multicams.map(m => if m.id == mcId then m.copy(angles = m.angles :+ angle) else m))
+
+  /** The angle of group `mcId` showing at timeline frame `frame` — the angle of the program cut that
+    * contains it — or -1 when the frame is off the program. Drives the switcher's on-air highlight. */
+  def activeAngleAt(project: Project, mcId: String, frame: Int): Int =
+    project.tracks.filter(_.kind == MediaKind.Video).flatMap(_.clips).filter(_.mc.contains(mcId))
+      .find(c => frame >= c.timelineStart && frame < c.timelineEnd).map(_.angle).getOrElse(-1)
+
   /** Switch the program of group `mcId` to `angle` at timeline frame `atFrame`, across the project. The
     * group's cuts live on a video track; that track's cuts are re-cut through [[switchAt]] while its other
     * clips and — crucially — the audio bed on its audio track are left untouched, so the sound plays

@@ -440,6 +440,18 @@ private[kutter] object Diagnostics:
       check("mc switchProgram cuts", switched.tracks.find(_.id == "v1").get.clips.sortBy(_.timelineStart).map(c => (c.timelineStart, c.length, c.angle)), List((0, 60, 0), (60, 60, 1)))
       check("mc switchProgram bed intact", switched.tracks.find(_.id == "a1").get.clips.map(c => (c.timelineStart, c.length, c.angle)), List((0, 120, 0)))
 
+      // buildProgram assembles a group plus its two dedicated tracks from bin clips (no envelopes → every
+      // angle at offset 0); activeAngleAt reads which angle is on air at a frame; addTitle appends a slide.
+      val vidClips       = List(MediaClip.make("a.mp4", MediaKind.Video, 120), MediaClip.make("b.mp4", MediaKind.Video, 90))
+      val (bg, bvt, bat) = Multicam.buildProgram(vidClips, Map.empty, 30, 120)
+      check("mc buildProgram angles", bg.angles.size, 2)
+      check("mc buildProgram video", (bvt.kind, bvt.clips.map(c => (c.timelineStart, c.length, c.angle))), (MediaKind.Video, List((0, 120, 0))))
+      check("mc buildProgram bed", (bat.kind, bat.clips.map(c => (c.timelineStart, c.length))), (MediaKind.Audio, List((0, 120))))
+      val bproj = Project.blank.copy(multicams = List(bg), tracks = List(bvt, bat))
+      check("mc activeAngleAt on", Multicam.activeAngleAt(bproj, bg.id, 50), 0)
+      check("mc activeAngleAt off", Multicam.activeAngleAt(bproj, bg.id, 500), -1)
+      check("mc addTitle appends", Multicam.addTitle(bproj, bg.id, Multicam.titleAngle("T", "N", "S")).multicams.head.angles.size, 3)
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true

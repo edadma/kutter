@@ -264,8 +264,8 @@ private val App: Component[Session] = component[Session] { initial =>
   // signature compile to the same graph, so a change that only moved a fader can be told apart from one
   // that needs a rebuild.
   def graphSig(p: Project): Any =
-    (p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart)))),
-     p.lowerThirds)
+    (p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart, pc.mc, pc.angle)))),
+     p.lowerThirds, p.multicams)
 
   val edited     = useRef(false)
   val lastPushed = useRef(initial.project)
@@ -735,7 +735,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // in-point, length, start) in order — so opening a project with the same media reuses the live
   // graph-swap and a different arrangement re-opens.
   def mediaKey(p: Project): Seq[Any] =
-    p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart))))
+    p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart, pc.mc, pc.angle))))
 
   // Apply a project loaded from `loadedPath`: if it arranges the same media as the current project, the
   // live rebuild handles it (just swap the project state); otherwise everything the player built is tied
@@ -802,6 +802,52 @@ private val App: Component[Session] = component[Session] { initial =>
   def selectLt(id: String): Unit =
     setSelectedId(Some(id))
     setSelectedClipId(None)
+
+  // Multicam: cutting one program picture between synced angles (cameras and title slides) while one
+  // source's audio plays through. The MVP holds one group; these derive what the switcher shows — the
+  // group, the angle on air at the playhead (for the highlight), and whether the bin has the two videos a
+  // group needs.
+  val mcGroup   = project.multicams.headOption
+  val mcActive  = mcGroup.map(g => Multicam.activeAngleAt(project, g.id, playheadRef.current)).getOrElse(-1)
+  val canMakeMc = project.bin.count(_.kind == MediaKind.Video) >= 2
+
+  // Build a multicam program from the bin's videos: sync them by their audio (envelopes from the player's
+  // waveform cache, best-effort — an ungenerated one leaves an angle at offset 0 to nudge), put the
+  // switched program on its own dedicated tracks, and drop the plain placements those clips had on the
+  // shared tracks so the program is the single home for that footage. Re-opens: tracks and generators change.
+  def makeMulticam(): Unit =
+    val vids = project.bin.filter(_.kind == MediaKind.Video)
+    if vids.size >= 2 then
+      val envs = vids.map(c => c.path -> (playerRef.current match
+        case pl: Player => pl.waveFor(c.path) match { case w: Waveform => w.envelope; case null => Array.empty[Float] }
+        case null       => Array.empty[Float])).toMap
+      val length      = math.max(1, if vids.head.frames > 0 then vids.head.frames else Player.mediaLength(vids.head.path, project.spec))
+      val (g, vt, at) = Multicam.buildProgram(vids, envs, math.round(fps * 2).toInt, length)
+      val angleIds    = vids.map(_.id).toSet
+      val cleared     = project.tracks.map(t => t.copy(clips = t.clips.filterNot(c => angleIds.contains(c.clipId))))
+      dirty.current = true
+      reopen(project.copy(tracks = cleared :+ vt :+ at, multicams = project.multicams :+ g), path)
+
+  // Cut the program to angle `i` at the playhead — the one action both a live switch (clicked while
+  // playing) and a frame-precise one (scrubbed, then clicked) drive. Rides the live graph-swap: the cut
+  // list changes so the graph rebuilds, but the sources and their generators do not, so no re-open.
+  def switchMulticam(i: Int): Unit =
+    mcGroup.foreach(g => editProject(p => Multicam.switchProgram(p, g.id, playheadRef.current, i)))
+
+  // Add a title-slide angle to the group so the program can cut to a title. It takes the selected lower
+  // third's words and look when one is selected, else a placeholder the user renames in the project file.
+  def addMcTitle(): Unit =
+    mcGroup.foreach { g =>
+      val lt  = selectedId.flatMap(id => project.lowerThirds.find(_.id == id))
+      val ang = Multicam.titleAngle(
+        lt.map(_.name).filter(_.nonEmpty).getOrElse("Title"),
+        lt.map(_.name).getOrElse("Title"), lt.map(_.title).getOrElse("Subtitle"),
+        lt.map(_.styleId).getOrElse(project.styles.head.id), lt.flatMap(_.body))
+      editProject(p => Multicam.addTitle(p, g.id, ang))
+    }
+
+  val multicamPanel =
+    MulticamPanel(MulticamProps(mcGroup, mcActive, canMakeMc, () => makeMulticam(), i => switchMulticam(i), () => addMcTitle()))
 
   // The bin panel (left) — see [[BinPanel]]. Its data comes from the project; its actions reach back
   // through the project-op and import helpers.
@@ -876,7 +922,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // The player panel (centre): the monitor tabs over the preview and its transport, grouped as one card.
   val playerPanel =
     panel(flexN = 1)(
-      col(crossAxisAlignment = CrossAxisAlignment.Stretch)(monitorTabs, preview, transport),
+      col(crossAxisAlignment = CrossAxisAlignment.Stretch)(monitorTabs, preview, transport, multicamPanel),
     )
 
   // The inspector (right) — see [[InspectorPanel]]. The selection is resolved here (a clip and a lower
