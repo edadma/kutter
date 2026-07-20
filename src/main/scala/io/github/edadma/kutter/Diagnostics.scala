@@ -540,17 +540,27 @@ private[kutter] object Diagnostics:
       Mlt.close()
       return true
 
-    // `KUTTER_PROBE_BLACK` renders a titles-only project (no clips on any track) to a PNG — checking the
-    // black colour producer base composites the lower thirds so a texish card can be previewed before any
-    // footage.
+    // `KUTTER_PROBE_BLACK` proves the whole titles-only path works with NO video loaded — titles must not
+    // depend on footage (a user may design titles before a shoot, or render a titles-only video). It
+    // renders three states off a blank project: (1) an all-empty project (the transient right after a
+    // title is added to the bin but not yet placed — the player opens on `hasContent` yet no placement is
+    // in the graph) must build and render black without crashing; (2) a title placed on the default V1 —
+    // the video track a blank project always has, so a title can be placed with no footage — composites
+    // over the black base; (3) the same over a run of the title's fade.
     if sys.env.contains("KUTTER_PROBE_BLACK") then
       Mlt.init()
-      val proj = withTitles(Project.blank, List(
-        (LowerThird("t", "Jane Smith", "CEO, Acme", styleId = "texish-card"), 0, 90),
-      ))
-      Player.probe(proj, 45, "probe-black.png")
+      // (1) The all-empty transient: a title in the bin (library) but not placed — the graph is just the
+      // black base and the empty default tracks. Must not crash.
+      val unplaced = Project.blank.copy(lowerThirds = List(LowerThird("t", "Jane Smith", "CEO, Acme", styleId = "texish-card")))
+      Player.probe(unplaced, 10, "probe-blank.png")
+      // (2)/(3) The title placed on the blank project's own V1 (no footage anywhere), rendered opaque and
+      // mid-fade to confirm it composites over the black base and fades on its local frames.
+      val placed = unplaced.copy(tracks = unplaced.tracks.map(t =>
+        if t.id == "v1" then t.copy(clips = List(PlacedClip.makeTitle("t", 0, 90))) else t))
+      Player.probe(placed, 45, "probe-black.png")     // opaque, over black
+      Player.probe(placed, 6, "probe-black-fade.png") // mid fade-in
       Mlt.close()
-      println("black-base render wrote probe-black.png")
+      println("titles-only (no video) render: probe-blank.png (unplaced transient), probe-black.png (placed on V1), probe-black-fade.png (mid-fade)")
       return true
 
     // `KUTTER_PROBE_CARD` renders the texish-card style — whose template paints a translucent
