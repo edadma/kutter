@@ -420,6 +420,26 @@ private[kutter] object Diagnostics:
       check("sync self zero", AudioSync.bestLag(ea, ea, 8), 0)
       check("sync flat zero", AudioSync.bestLag(Array.fill(60)(0.5f), Array.fill(60)(0.5f), 8), 0)
 
+      // Project-level multicam ops the UI drives: build a synced group from bin sources (Cam B trailing
+      // Cam A by 3 frames → offset 3), place its program cut and continuous bed on the fixed tracks, and
+      // switch the program angle across the whole project — re-cutting the video track while the audio bed
+      // stays whole, which is why the sound plays through a picture cut.
+      def clipOffset(a: Angle): Int = a.source match { case AngleSource.Clip(_, o) => o; case _ => -1 }
+      val syncSources = List(("clipA", "Cam A", env(Set(10, 20, 40), 60)), ("clipB", "Cam B", env(Set(13, 23, 43), 60)))
+      val angs        = Multicam.syncedAngles(syncSources, bedIdx = 0, maxLag = 8)
+      check("mc syncedAngles bed", clipOffset(angs.head), 0)
+      check("mc syncedAngles cam", clipOffset(angs(1)), 3)
+
+      val grp2   = Multicam.make("Show2", angs, audioAngle = 0)
+      val placed = Multicam.place(Project.blank, grp2, atFrame = 0, length = 120, programTrackId = "v1", audioTrackId = "a1")
+      check("mc place registers", placed.multicams.map(_.id), List(grp2.id))
+      check("mc place program", placed.tracks.find(_.id == "v1").get.clips.map(c => (c.timelineStart, c.length, c.angle)), List((0, 120, 0)))
+      check("mc place bed", placed.tracks.find(_.id == "a1").get.clips.map(c => (c.timelineStart, c.length)), List((0, 120)))
+
+      val switched = Multicam.switchProgram(placed, grp2.id, atFrame = 60, angle = 1)
+      check("mc switchProgram cuts", switched.tracks.find(_.id == "v1").get.clips.sortBy(_.timelineStart).map(c => (c.timelineStart, c.length, c.angle)), List((0, 60, 0), (60, 60, 1)))
+      check("mc switchProgram bed intact", switched.tracks.find(_.id == "a1").get.clips.map(c => (c.timelineStart, c.length, c.angle)), List((0, 120, 0)))
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true

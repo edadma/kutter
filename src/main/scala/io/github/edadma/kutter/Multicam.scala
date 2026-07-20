@@ -104,6 +104,51 @@ object Multicam:
         case _ => c :: acc
     }.reverse
 
+  /** Build a group's angles from a set of bin sources, auto-synced by their audio. Each source is a
+    * `(clipId, label, envelope)`; the `bedIdx`-th is the reference (offset 0, the audio bed), and every
+    * other clip angle is offset by the lag at which its envelope best matches the reference's (see
+    * [[AudioSync]]). A source with an empty envelope stays at offset 0 — nothing to correlate — so the
+    * user can nudge it by hand. Title angles are added separately; this sizes only the camera angles. */
+  def syncedAngles(sources: List[(String, String, Array[Float])], bedIdx: Int, maxLag: Int): List[Angle] =
+    val bedEnv = sources.lift(bedIdx).map(_._3).getOrElse(Array.empty[Float])
+    sources.zipWithIndex.map { case ((clipId, label, env), i) =>
+      val offset = if i == bedIdx || env.isEmpty || bedEnv.isEmpty then 0 else AudioSync.syncOffset(bedEnv, env, maxLag)
+      clipAngle(label, clipId, offset)
+    }
+
+  /** Place `mc`'s program on the timeline: the opening cut of `initialAngle` across `[atFrame, atFrame +
+    * length)` on the video track `programTrackId`, and the continuous audio bed on `audioTrackId`. The
+    * group is registered on the project if it is not already. The cuts and bed are appended to those
+    * tracks, so a caller places into free space (a fresh program track is the clean home for a group). */
+  def place(project: Project, mc: Multicam, atFrame: Int, length: Int,
+      programTrackId: String, audioTrackId: String, initialAngle: Int = 0): Project =
+    val cuts = initialProgram(mc, atFrame, length, initialAngle)
+    val bed  = audioBed(mc, atFrame, length).toList
+    val withGroup = if project.multicams.exists(_.id == mc.id) then project else project.copy(multicams = project.multicams :+ mc)
+    withGroup
+      .updateTrack(programTrackId)(t => t.copy(clips = t.clips ++ cuts))
+      .updateTrack(audioTrackId)(t => t.copy(clips = t.clips ++ bed))
+
+  /** Switch the program of group `mcId` to `angle` at timeline frame `atFrame`, across the project. The
+    * group's cuts live on a video track; that track's cuts are re-cut through [[switchAt]] while its other
+    * clips and — crucially — the audio bed on its audio track are left untouched, so the sound plays
+    * through the picture cut. This is the one operation both a live switch (clicked during playback) and a
+    * frame-precise switch (scrubbed to a frame, then clicked) drive. A missing group is a no-op. */
+  def switchProgram(project: Project, mcId: String, atFrame: Int, angle: Int): Project =
+    project.mcFor(mcId) match
+      case None => project
+      case Some(mc) =>
+        project.copy(tracks = project.tracks.map { t =>
+          if t.kind != MediaKind.Video then t
+          else
+            val groupCuts = t.clips.filter(_.mc.contains(mcId))
+            if groupCuts.isEmpty then t
+            else
+              val progStart = groupCuts.map(_.timelineStart).min
+              val others    = t.clips.filterNot(_.mc.contains(mcId))
+              t.copy(clips = others ++ switchAt(groupCuts, mc, progStart, atFrame, angle))
+        })
+
   /** Switch the program angle at frame `f`: from `f` up to the next existing cut boundary, show `angle`.
     * The cut containing `f` is split there — its left part keeps its old angle, its right part is re-cut to
     * the new angle (re-syncing a clip angle's in-point) — and same-angle neighbours are merged, so a switch
