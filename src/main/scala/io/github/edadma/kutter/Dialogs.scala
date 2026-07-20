@@ -13,6 +13,10 @@ import io.github.edadma.suit.widgets.*
 // — held as one value in `App` so a fill-and-cancel never touches the project.
 private[kutter] final case class SettingsDraft(name: String, created: String, spec: TimelineSpec)
 
+// A pending confirmation: the dialog shows its title and message, and runs `action` on confirm. One
+// `App` state drives every destructive prompt (remove a clip, clear the project), rather than a flag each.
+private[kutter] final case class ConfirmSpec(title: String, message: String, confirmLabel: String, action: () => Unit)
+
 /** The confirmation modal, shown while a `ConfirmSpec` is pending. Cancel or the scrim dismisses it;
   * the action button runs the pending action. One dialog serves every destructive prompt. */
 private final case class ConfirmProps(spec: Option[ConfirmSpec], onDismiss: () => Unit)
