@@ -15,6 +15,18 @@ object Timeline:
   val TrackHeight = 68.0 // one track widget's height
   val LabelWidth  = 60.0 // the track-name column down the left, as in any editor; the ruler leaves it blank
 
+  /** The working timeline length (in frames at the 30fps profile) a project has before any footage is
+    * placed, so lower thirds can be laid out ahead of the video — 10 seconds. */
+  val DefaultTimelineFrames = 300
+
+  /** How far the timeline runs past its content, as a floor in frames (a minute) — the tail of empty
+    * space that lets a clip be slid rightward, a drop land past the end, and material be placed well
+    * beyond what is already there. The actual tail is this or the whole content again, whichever is
+    * larger, so runway scales with the project; it costs nothing on screen (the view has a fixed scale
+    * and simply pans), and placing something in it grows the timeline further, so the runway never runs
+    * out. See where `total` is computed in `App`. */
+  val TimelineTailFrames = 1800
+
   /** One lower third's block on the titles lane: its window on the timeline, a caption, the colour it
     * wears (drawn from its style), and whether it is the selected one. */
   case class OverlayBlock(

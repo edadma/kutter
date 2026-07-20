@@ -24,18 +24,6 @@ import scala.io.Source
 // `Project` (the data model), and `CardRenderer`/`TexishCard` (the lower-third look). This file holds
 // the suit component and the entry point.
 
-// The working timeline length (in frames at the 30fps profile) a project has before any footage is
-// placed, so lower thirds can be laid out ahead of the video — 10 seconds.
-private val DefaultTimelineFrames = 300
-
-// How far the timeline runs past its content, as a floor in frames (a minute) — the tail of empty
-// space that lets a clip be slid rightward, a drop land past the end, and material be placed well
-// beyond what is already there. The actual tail is this or the whole content again, whichever is
-// larger, so runway scales with the project; it costs nothing on screen (the view has a fixed
-// scale and simply pans), and placing something in it grows the timeline further, so the runway
-// never runs out. See where `total` is computed.
-private val TimelineTailFrames = 1800
-
 // Which monitor the centre panel shows, and which player the transport drives. The project monitor plays
 // the assembled timeline; the clip monitor previews a single bin clip in isolation (as in kdenlive). Only
 // one is engaged at a time — switching to the clip monitor pauses the project player and opens a light
@@ -360,19 +348,19 @@ private val App: Component[Session] = component[Session] { initial =>
   // rate is the profile's.
   val (contentReach, fps) = playerRef.current match
     case p: Player => (math.max(p.totalFrames, projectExtent), p.fps)
-    case null      => (math.max(DefaultTimelineFrames, projectExtent), project.spec.fps)
+    case null      => (math.max(Timeline.DefaultTimelineFrames, projectExtent), project.spec.fps)
 
   // The timeline's length: the content plus a tail of empty space, so a clip can always be slid right
   // (opening a gap before it for an intro) and a drop near the end has room. The tail grows with the
   // content — projectExtent tracks a moved clip — so within a project the runway never runs out; the
   // graph itself is only sized to the content (the black base ends at `contentReach`), so the tail is
   // purely timeline headroom, not rendered frames.
-  val total    = contentReach + math.max(TimelineTailFrames, contentReach)
+  val total    = contentReach + math.max(Timeline.TimelineTailFrames, contentReach)
 
   // The span the "fit" framing shows: the content plus a little margin — not the pan runway, which
   // exists to give placements room, not to be looked at. An empty project fits its default window.
   // Passed to [[TimelinePanel]], which owns the viewport.
-  val fitFrames = math.max(DefaultTimelineFrames, math.round(projectExtent * 1.05).toInt)
+  val fitFrames = math.max(Timeline.DefaultTimelineFrames, math.round(projectExtent * 1.05).toInt)
 
   // The active monitor's length: the *content* reach in the project monitor (what actually plays —
   // the graph ends at the last clip/lower third, not in the empty runway the timeline pads on for
@@ -993,27 +981,10 @@ private val App: Component[Session] = component[Session] { initial =>
   // A branded splash in its own small window before the player window opens.
   Splash.show("assets/logo.png", 1000)
 
-  // What the app opens with — no hardcoded project, and (like a real editor) no clip loaded by default.
-  // A `.kutter` argument is opened and stays bound to its file. A bare media path resumes the remembered
-  // session when it holds that same clip (so reopening reloads the work done last time), otherwise it
-  // starts a blank project with that clip placed on V1. With no argument, it resumes whatever session
-  // was remembered — the project last worked on — or, when there is none, opens empty (no media),
-  // leaving the user to import a video or open a project. The session is re-cached on every edit (see
-  // the effect in `App`), which is what makes a reopen reload the contents. The clip's length is
-  // measured against the profile, which needs MLT initialised (done above).
-  val session =
-    args.headOption match
-      case Some(a) if a.endsWith(".kutter") => Session(project, Some(a))
-      case Some(mediaArg) =>
-        SessionStore.load()
-          .filter(_.project.bin.exists(_.path == mediaArg))
-          .getOrElse {
-            // A bare media argument starts a fresh project that adopts the clip's own format.
-            val spec = Player.probeSpec(mediaArg)
-            Session(Diagnostics.videoProject(mediaArg, Player.mediaLength(mediaArg, spec)).withSpec(spec), None)
-          }
-      case None =>
-        SessionStore.load().getOrElse(Session(Project.blank, None))
+  // What the app opens with — resolved from the argument (a `.kutter` project, a bare media path, or
+  // nothing) against the remembered session; see [[Session.resolve]]. Needs MLT initialised (done
+  // above) since a media argument is probed for its length and format.
+  val session = Session.resolve(args, project)
 
   Suit.run("kutter", 1100, 720, maximized = true)(App(session))
   Mlt.close()
