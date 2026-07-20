@@ -47,12 +47,8 @@ private final case class ConfirmSpec(title: String, message: String, confirmLabe
 private enum MonitorMode:
   case Project, Clip
 
-/** Format a frame count as m:ss.cc (hundredths of a second) at the given frame rate, for the
-  * transport's time readout. */
-private def timecode(frames: Int, fps: Double): String =
-  val cs   = math.max(0L, (frames / fps * 100).toLong) // centiseconds, floored
-  val secs = cs / 100
-  f"${secs / 60}:${secs % 60}%02d.${cs % 100}%02d"
+/** Format a frame count as m:ss.cc at the given frame rate — see [[KutterUi.timecode]]. */
+private def timecode(frames: Int, fps: Double): String = KutterUi.timecode(frames, fps)
 
 // Everything the transport needs from the editor, as a plain bundle. `player` reads the monitor the
 // transport currently drives (the active one), so the transport can poll its position without the
@@ -172,13 +168,8 @@ private val App: Component[Session] = component[Session] { initial =>
   // player against a new profile) happens once on Apply rather than on every keystroke. Seeded from the
   // project when the dialog opens.
   val (settingsOpen, setSettingsOpen, _) = useState(false)
-  val (dfName, setDfName, _)     = useState("")
-  val (dfCreated, setDfCreated, _) = useState("")
-  val (dfW, setDfW, _)           = useState(1280)
-  val (dfH, setDfH, _)           = useState(720)
-  val (dfFpsN, setDfFpsN, _)     = useState(30)
-  val (dfFpsD, setDfFpsD, _)     = useState(1)
-  val (dfAudio, setDfAudio, _)   = useState(48000)
+  val (settingsDraft, setSettingsDraft, updateSettingsDraft) =
+    useState(SettingsDraft("", "", TimelineSpec.default))
 
   // A running video export: whether one is in progress, its 0..1 progress for the bar, and the job it
   // polls plus the path it is writing (refs — the poll reads them imperatively). A poll advances the
@@ -511,15 +502,9 @@ private val App: Component[Session] = component[Session] { initial =>
   def editLt(id: String, f: LowerThird => LowerThird): Unit =
     editProject(p => p.copy(lowerThirds = p.lowerThirds.map(lt => if lt.id == id then f(lt) else lt)))
 
-  // Open the project-settings dialog, seeding its drafts from the current project.
+  // Open the project-settings dialog, seeding its draft from the current project.
   def openSettings(): Unit =
-    setDfName(project.name)
-    setDfCreated(project.created)
-    setDfW(project.spec.width)
-    setDfH(project.spec.height)
-    setDfFpsN(project.spec.fpsNum)
-    setDfFpsD(project.spec.fpsDen)
-    setDfAudio(project.spec.audioRate)
+    setSettingsDraft(SettingsDraft(project.name, project.created, project.spec))
     setSettingsOpen(true)
 
   def toggle(): Unit =
@@ -950,27 +935,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // Wrap content in a rounded, bordered card — the editor's panel shell. It clips, so a video's
   // letterbox or a canvas's fill honours the rounded corners.
   def panel(flexN: Int = 0, h: Double = Double.NaN)(child: VNode): VNode =
-    box(bg = theme.surface, flex = flexN, height = h, radius = 10, border = theme.border, borderWidth = 1, clip = true)(
-      child,
-    )
-
-  // A titled panel: a small header bar over the panel's body — the shell the bin and the inspector use,
-  // matching a Resolve-style editor's labelled panes.
-  def titledPanel(title: String)(body: VNode): VNode =
-    panel(flexN = 1)(
-      col(crossAxisAlignment = CrossAxisAlignment.Stretch)(
-        box(bg = theme.background, padding = EdgeInsets.symmetric(horizontal = 12, vertical = 8))(
-          text(title, size = 12, weight = FontWeight.Bold, color = theme.surfaceText),
-        ),
-        box(flex = 1, padding = EdgeInsets.all(12))(body),
-      ),
-    )
-
-  // A placeholder body for a panel whose feature isn't built yet — a centred hint.
-  def placeholder(hint: String): VNode =
-    col(mainAxisAlignment = MainAxisAlignment.Center, crossAxisAlignment = CrossAxisAlignment.Center)(
-      text(hint, size = 13, color = theme.border),
-    )
+    KutterUi.panel(theme)(flexN, h)(child)
 
   // Add a lower third and select it for editing. It opens around the current playhead — a sensible
   // default a user then tunes in the inspector — and starts on the first style. A lower third is
@@ -1083,9 +1048,9 @@ private val App: Component[Session] = component[Session] { initial =>
   // needs its frame counts remapped.
   def applySettings(): Unit =
     setSettingsOpen(false)
-    val newSpec = TimelineSpec(dfW, dfH, dfFpsN, dfFpsD, dfAudio)
-    val newName = dfName.trim match { case "" => "Untitled"; case s => s }
-    val renamed = project.copy(name = newName, created = dfCreated.trim)
+    val newSpec = settingsDraft.spec
+    val newName = settingsDraft.name.trim match { case "" => "Untitled"; case s => s }
+    val renamed = project.copy(name = newName, created = settingsDraft.created.trim)
     if newSpec != project.spec then
       dirty.current = true
       resetView()
@@ -1305,101 +1270,42 @@ private val App: Component[Session] = component[Session] { initial =>
       case _ => ()
     }
 
-  // A small text button — a rounded, padded hit target used for the panel's actions.
-  def textButton(label: String, onClick: () => Unit, enabled: Boolean = true): VNode =
-    box(onClick = if enabled then (_ => onClick()) else (_ => ()),
-      cursor = if enabled then Cursor.Pointer else Cursor.Default, bg = theme.background, radius = 6,
-      padding = EdgeInsets.symmetric(horizontal = 10, vertical = 6))(
-      text(label, size = 12, color = if enabled then theme.surfaceText else theme.border),
-    )
+  // Remove a bin clip, confirming first — removing a source takes its timeline placements with it.
+  def confirmRemoveClip(clip: MediaClip): Unit =
+    setConfirm(Some(ConfirmSpec(
+      "Remove clip?",
+      s"Remove “${clip.name}” from the project? Its placements on the timeline go with it; the lower thirds are kept.",
+      "Remove",
+      () => removeBinClip(clip.id),
+    )))
 
-  // One lower-third row in the bin panel: a selectable body (name over title) and a remove button. The
-  // selected row is filled with the primary colour so it reads as the inspector's subject.
-  def ltRow(lt: LowerThird): VNode =
-    val selected = selectedId.contains(lt.id)
-    row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-      box(onClick = _ => { setSelectedId(Some(lt.id)); setSelectedClipId(None) }, cursor = Cursor.Pointer, flex = 1, radius = 6,
-        bg = if selected then theme.primary else theme.background,
-        padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
-        col(mainAxisSize = MainAxisSize.Min, spacing = 1)(
-          text(if lt.name.isEmpty then "(untitled)" else lt.name, size = 12,
-            color = if selected then theme.onPrimary else theme.surfaceText),
-          text(lt.title, size = 10, color = if selected then theme.onPrimary else theme.border),
-        ),
-      ),
-      box(onClick = _ => removeLowerThird(lt.id), cursor = Cursor.Pointer, radius = 4, padding = EdgeInsets.all(4))(
-        svg(closeIcon, width = 12, height = 12),
-      ),
-    )
+  // Select a lower third for the inspector (clearing any clip selection — the two are exclusive).
+  def selectLt(id: String): Unit =
+    setSelectedId(Some(id))
+    setSelectedClipId(None)
 
-  // One bin row: a kind icon, the file name, and a remove button that confirms first (removing a source
-  // takes its placements off the timeline with it). Clicking the name previews the clip in the clip
-  // monitor (the selected clip's row fills with the primary colour); the Place button drops it on the
-  // timeline. The lower thirds are kept — footage and overlays are independent.
-  def binClipRow(clip: MediaClip): VNode =
-    val selected = selectedBinId.contains(clip.id)
-    row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
-      svg(if clip.kind == MediaKind.Audio then volumeIcon else playIcon, width = 16, height = 16),
-      box(onClick = _ => showClipMonitor(clip), cursor = Cursor.Pointer, flex = 1, radius = 6,
-        bg = if selected then theme.primary else Color.transparent,
-        padding = EdgeInsets.symmetric(horizontal = 6, vertical = 4))(
-        text(clip.name, size = 13, color = if selected then theme.onPrimary else theme.surfaceText, maxLines = 1),
-      ),
-      textButton("Place", () => placeAtPlayhead(clip)),
-      box(onClick = _ => setConfirm(Some(ConfirmSpec(
-        "Remove clip?",
-        s"Remove “${clip.name}” from the project? Its placements on the timeline go with it; the lower thirds are kept.",
-        "Remove",
-        () => removeBinClip(clip.id),
-      ))), cursor = Cursor.Pointer, radius = 4, padding = EdgeInsets.all(4))(svg(closeIcon, width = 12, height = 12)),
-    )
-
-  // The bin panel (left): the project's imported source clips and its lower thirds, each a titled
-  // section with actions on the right (import a video or audio clip / add a lower third). Both can be
-  // built up with or without the other — a project is its overlays and its footage, independently — and
-  // Open/Save/Import act on the project as a whole. Selecting a lower-third row drives the inspector.
-  val binPanel = titledPanel("Bin")(
-    col(crossAxisAlignment = CrossAxisAlignment.Stretch, spacing = 10)(
-      // Project actions: start over, open/save a `.kutter`, project settings, export a video.
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-        textButton("New", () => requestNew()),
-        textButton("Open", () => doOpen()),
-        textButton("Save", () => doSave()),
-        textButton("Settings", () => openSettings()),
-        spacer(),
-        textButton("Export", () => requestExport()),
-      ),
-      // Media section: the imported clips (video and audio), each removable, with import actions — a
-      // project can hold several videos (composited on video tracks) and several audio clips (mixed).
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-        text("Media", size = 11, weight = FontWeight.Bold, color = theme.border),
-        spacer(),
-        textButton("+ Video", () => doImportVideo()),
-        textButton("+ Audio", () => doImportAudio()),
-      ),
-      if project.bin.isEmpty then placeholder("No media imported")
-      else
-        col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 4)(
-          project.bin.map(binClipRow)*,
-        ),
-      // Lower thirds section: import a `.klt` list or add one by hand — both work with or without footage.
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-        text("Lower thirds", size = 11, weight = FontWeight.Bold, color = theme.border),
-        spacer(),
-        textButton("Import…", () => doImportLowerThirds()),
-        textButton("+ Add", () => addLowerThird()),
-      ),
-      box(flex = 1)(
-        if project.lowerThirds.isEmpty then placeholder("No lower thirds yet")
-        else
-          scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
-            col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 3)(
-              project.lowerThirds.map(ltRow)*,
-            ),
-          ),
-      ),
-    ),
-  )
+  // The bin panel (left) — see [[BinPanel]]. Its data comes from the project; its actions reach back
+  // through the project-op and import helpers.
+  val binPanel = BinPanel(BinProps(
+    bin           = project.bin,
+    lowerThirds   = project.lowerThirds,
+    selectedBinId = selectedBinId,
+    selectedLtId  = selectedId,
+    onNew         = () => requestNew(),
+    onOpen        = () => doOpen(),
+    onSave        = () => doSave(),
+    onSettings    = () => openSettings(),
+    onExport      = () => requestExport(),
+    onImportVideo = () => doImportVideo(),
+    onImportAudio = () => doImportAudio(),
+    onImportLts   = () => doImportLowerThirds(),
+    onAddLt       = () => addLowerThird(),
+    onPreviewClip = showClipMonitor,
+    onPlaceClip   = placeAtPlayhead,
+    onRemoveClip  = confirmRemoveClip,
+    onSelectLt    = selectLt,
+    onRemoveLt    = removeLowerThird,
+  ))
 
   // A centred hint shown over the black preview when there is no picture to show.
   def previewHint(msg: String): VNode =
@@ -1454,110 +1360,18 @@ private val App: Component[Session] = component[Session] { initial =>
       col(crossAxisAlignment = CrossAxisAlignment.Stretch)(monitorTabs, preview, transport),
     )
 
-  // A labelled inspector control: a small caption over the field.
-  def labeled(label: String)(control: VNode): VNode =
-    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 4)(
-      text(label, size = 11, weight = FontWeight.Bold, color = theme.border),
-      control,
-    )
-
-  // A whole-number field: a text field that commits only a value that parses, so a partial or empty
-  // entry leaves the model untouched rather than snapping it to zero.
-  def intField(value: Int, onChange: Int => Unit): VNode =
-    TextField(value.toString, s => s.trim.toIntOption.foreach(onChange))
-
-  // The inspector body for the selected lower third: its words, its style, and its timing. Every edit
-  // funnels through `editLt`, so a keystroke re-renders and the player recompiles its graph.
-  def inspectorBody(lt: LowerThird): VNode =
-    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 12)(
-      labeled("Name")(TextField(lt.name, v => editLt(lt.id, _.copy(name = v)))),
-      labeled("Title")(TextField(lt.title, v => editLt(lt.id, _.copy(title = v)))),
-      labeled("Style")(
-        Select(
-          options  = project.styles.map(s => (s.id, s.label)),
-          selected = lt.styleId,
-          onChange = v => editLt(lt.id, _.copy(styleId = v)),
-          width    = 200,
-        ),
-      ),
-      row(crossAxisAlignment = CrossAxisAlignment.Start, spacing = 8)(
-        box(flex = 1)(labeled("In")(intField(lt.inFrame, v => editLt(lt.id, _.copy(inFrame = v))))),
-        box(flex = 1)(labeled("Out")(intField(lt.outFrame, v => editLt(lt.id, _.copy(outFrame = v))))),
-        box(flex = 1)(labeled("Fade")(intField(lt.fadeFrames, v => editLt(lt.id, _.copy(fadeFrames = v))))),
-      ),
-    )
-
-  // The inspector body for the selected clip: its source, its timeline position and length, whether it
-  // is a linked A/V half, and a way to take it off the timeline. Position and length are read-only here;
-  // trimming and unlinking come with the timeline's edge handles.
-  def clipInspectorBody(pc: PlacedClip, clip: MediaClip): VNode =
-    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 12)(
-      labeled("Clip")(text(clip.name, size = 13, color = theme.surfaceText, maxLines = 1)),
-      row(crossAxisAlignment = CrossAxisAlignment.Start, spacing = 8)(
-        box(flex = 1)(labeled("Start")(text(timecode(pc.timelineStart, fps), size = 13, color = theme.surfaceText, mono = true))),
-        box(flex = 1)(labeled("Length")(text(timecode(pc.length, fps), size = 13, color = theme.surfaceText, mono = true))),
-      ),
-      if pc.link.isDefined then text("Linked A/V — picture and sound move together.", size = 11, color = theme.accent, maxLines = 0)
-      else text("Unlinked.", size = 11, color = theme.border),
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
-        textButton("Remove from timeline", () => removePlacement(pc.id)),
-        if pc.link.isDefined then textButton("Unlink", () => unlinkPlacement(pc.id)) else spacer(),
-      ),
-    )
-
-  // The inspector (right): the selected clip's details, else the selected lower third's editor, else a
-  // hint. A clip and a lower third are never selected at once, so at most one editor shows.
+  // The inspector (right) — see [[InspectorPanel]]. The selection is resolved here (a clip and a lower
+  // third are never selected at once) and passed in; edits funnel back through the callbacks.
   val selectedClip =
     selectedClipId.flatMap(id =>
       project.tracks.flatMap(_.clips).find(_.id == id).flatMap(pc => project.clipFor(pc.clipId).map((pc, _))))
   val selectedLt     = selectedId.flatMap(id => project.lowerThirds.find(_.id == id))
-  val inspectorPanel = titledPanel("Inspector")(
-    selectedClip match
-      case Some((pc, clip)) => clipInspectorBody(pc, clip)
-      case None =>
-        selectedLt match
-          case Some(lt) => inspectorBody(lt)
-          case None     => placeholder("Select a clip or lower third"),
-  )
+  val inspectorPanel =
+    InspectorPanel(InspectorProps(selectedClip, selectedLt, project.styles, fps, editLt, removePlacement, unlinkPlacement))
 
-  // A track's mute toggle: a small "M" that fills with the primary colour while the track is silenced,
-  // matching the app's "active reads as primary" idiom.
-  def muteButton(t: Track): VNode =
-    box(onClick = _ => toggleMute(t.id), cursor = Cursor.Pointer, radius = 6,
-      bg = if t.muted then theme.primary else theme.background,
-      padding = EdgeInsets.symmetric(horizontal = 10, vertical = 6))(
-      text("M", size = 12, weight = FontWeight.Bold, color = if t.muted then theme.onPrimary else theme.border),
-    )
-
-  // One channel strip in the mixer: the track's name, its fader (a horizontal Slider over the linear
-  // gain), the dB readout of its effective gain (−∞ while muted), and the mute toggle. The fader edits
-  // `Track.volume` live, so the change is heard on the next graph swap without a re-open.
-  def faderRow(t: Track): VNode =
-    row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
-      sizedBox(width = 28)(text(t.name, size = 11, weight = FontWeight.Bold, color = theme.border)),
-      box(flex = 1)(Slider(t.volume, v => setTrackVolume(t.id, v))),
-      sizedBox(width = 58)(text(Mixer.dbLabel(t.gain), size = 11, color = theme.surfaceText, mono = true)),
-      muteButton(t),
-    )
-
-  // The audio mixer (a pane in the right column): a channel strip per audio track over a master strip.
-  // The master strip is the transport's volume control mirrored here — same value, same handler — so the
-  // two stay in lockstep; it drives the audio-device gain (`Player.setVolume`), not a graph filter.
-  val mixerPanel = titledPanel("Audio Mixer")(
-    col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 12)(
-      if project.audioTracks.isEmpty then placeholder("No audio tracks")
-      else col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 10)(
-        project.audioTracks.map(faderRow)*,
-      ),
-      box(height = 1, bg = theme.border)(),
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
-        sizedBox(width = 28)(text("Mix", size = 11, weight = FontWeight.Bold, color = theme.surfaceText)),
-        box(flex = 1)(Slider(volume, onVolume)),
-        sizedBox(width = 58)(text(Mixer.dbLabel(volume), size = 11, color = theme.surfaceText, mono = true)),
-        sizedBox(width = 34)(box()()),
-      ),
-    ),
-  )
+  // The audio mixer (a pane in the right column) — see [[MixerPanel]]. The master strip mirrors the
+  // transport's volume control (same value, same handler), so the two stay in lockstep.
+  val mixerPanel = MixerPanel(MixerProps(project.audioTracks, volume, setTrackVolume, toggleMute, onVolume))
 
   // The lane colour for a lower third, drawn from its style so a block on the timeline reads as the
   // look it wears: the accent stripe if the style has one, else the bar if it is solid enough, else
@@ -1774,101 +1588,18 @@ private val App: Component[Session] = component[Session] { initial =>
       ),
     )
 
-  // The confirmation modal (from suit), shown while a `ConfirmSpec` is pending. Cancel or the mask
-  // dismisses it; the action button runs the pending action. The spec's fields fill the title, message,
-  // and action-button label, so one dialog serves every destructive prompt.
-  val (cTitle, cMsg, cLabel, cAction) = confirm match
-    case Some(s) => (s.title, s.message, s.confirmLabel, s.action)
-    case None    => ("", "", "OK", () => ())
-  val confirmDialog =
-    Dialog(open = confirm.isDefined, onClose = () => setConfirm(None), width = 380)(
-      // A fixed inner width so the message wraps (the dialog does not constrain its content on its own).
-      sizedBox(width = 336)(
-        col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 16)(
-          text(cTitle, size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
-          text(cMsg, size = 13, color = theme.border, maxLines = 0),
-          row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
-            spacer(),
-            textButton("Cancel", () => setConfirm(None)),
-            textButton(cLabel, () => { setConfirm(None); cAction() }),
-          ),
-        ),
-      ),
-    )
-
-  // The project-settings dialog. Resolution/frame-rate/audio-rate are dropdowns of the common choices
-  // (with the current value added when it is not one of them, e.g. an auto-adopted odd size). The frame
-  // rate is the edit's clock, so it is only editable while the timeline is empty — once there is
-  // content it shows read-only, because changing it would reinterpret every clip's position in time.
-  val fpsLocked = hasContent(project)
-  val dfFps     = dfFpsN.toDouble / math.max(1, dfFpsD)
-  val dfFpsText = if math.abs(dfFps - math.rint(dfFps)) < 1e-6 then dfFps.toInt.toString else f"$dfFps%.2f"
-  val sizeVal   = s"${dfW}x${dfH}"
-  val sizeOpts  =
-    val base = TimelineSpec.sizeChoices.map((label, w, h) => (s"${w}x${h}", label))
-    if base.exists(_._1 == sizeVal) then base else (sizeVal, s"${dfW}×${dfH} (current)") +: base
-  val rateVal  = s"${dfFpsN}/${dfFpsD}"
-  val rateOpts =
-    val base = TimelineSpec.rateChoices.map((label, n, d) => (s"$n/$d", s"$label fps"))
-    if base.exists(_._1 == rateVal) then base else (rateVal, s"$dfFpsText fps (current)") +: base
-  val audioOpts = TimelineSpec.audioRateChoices.map(r => (r.toString, s"$r Hz"))
-
-  val settingsDialog =
-    Dialog(open = settingsOpen, onClose = () => setSettingsOpen(false), width = 440)(
-      sizedBox(width = 396)(
-        col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 14)(
-          text("Project Settings", size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
-          labeled("Name")(TextField(dfName, setDfName)),
-          labeled("Created")(TextField(dfCreated, setDfCreated)),
-          labeled("Resolution")(
-            Select(sizeOpts, sizeVal, v => v.split("x") match
-              case Array(w, h) => w.toIntOption.foreach(setDfW); h.toIntOption.foreach(setDfH)
-              case _           => (),
-            width = 372),
-          ),
-          if fpsLocked then
-            labeled("Frame rate")(
-              col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 3)(
-                text(s"$dfFpsText fps", size = 13, color = theme.surfaceText, mono = true),
-                text("Locked — the frame rate is the edit's clock. Clear the timeline to change it.",
-                  size = 11, color = theme.border, maxLines = 0),
-              ),
-            )
-          else
-            labeled("Frame rate")(
-              Select(rateOpts, rateVal, v => v.split("/") match
-                case Array(n, d) => n.toIntOption.foreach(setDfFpsN); d.toIntOption.foreach(setDfFpsD)
-                case _           => (),
-              width = 372),
-            ),
-          labeled("Audio rate")(
-            Select(audioOpts, dfAudio.toString, v => v.toIntOption.foreach(setDfAudio), width = 372),
-          ),
-          row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
-            spacer(),
-            textButton("Cancel", () => setSettingsOpen(false)),
-            textButton("Apply", () => applySettings()),
-          ),
-        ),
-      ),
-    )
-
-  // The export-progress dialog: a determinate bar over the encode, not dismissable by the scrim (the
-  // export is running behind it), with a Cancel that stops it.
-  val exportDialog =
-    Dialog(open = exporting, onClose = () => (), maskClosable = false, width = 380)(
-      sizedBox(width = 336)(
-        col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 16)(
-          text("Exporting video…", size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
-          text(s"${math.round(exportProgress * 100)}%", size = 13, color = theme.border, mono = true),
-          ProgressBar(exportProgress),
-          row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
-            spacer(),
-            textButton("Cancel", () => cancelExport()),
-          ),
-        ),
-      ),
-    )
+  // The modal dialogs — see [[ConfirmDialog]], [[SettingsDialog]], [[ExportDialog]]. Their state lives
+  // here; the components are presentational. The frame rate is editable only on an empty timeline.
+  val confirmDialog = ConfirmDialog(ConfirmProps(confirm, () => setConfirm(None)))
+  val settingsDialog = SettingsDialog(SettingsProps(
+    open      = settingsOpen,
+    draft     = settingsDraft,
+    fpsLocked = hasContent(project),
+    onChange  = updateSettingsDraft,
+    onApply   = () => applySettings(),
+    onClose   = () => setSettingsOpen(false),
+  ))
+  val exportDialog = ExportDialog(ExportProps(exporting, exportProgress, () => cancelExport()))
 
   ThemeProvider(theme)(
     box(bg = theme.background, padding = EdgeInsets.all(8))(
