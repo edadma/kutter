@@ -1025,6 +1025,16 @@ private val App: Component[Session] = component[Session] { initial =>
   // Add a video track and an audio track together — a camera's worth of lanes in one go, sharing one
   // number (the new Vn and An), so they read as a pair and a video clip dropped on the video half pairs its
   // sound to the audio half. The common multicam gesture: one click per camera.
+  // Split every clip crossing the playhead into two abutting clips — the razor. A cut keeps each source
+  // and just re-windows the two halves, so the generators are unchanged and it rides the live graph-swap
+  // (like a trim), not a re-open. Nothing to cut at the playhead is a no-op. The selection is cleared,
+  // since the clip it named may no longer exist as one piece.
+  def splitAtPlayhead(): Unit =
+    val f = playheadRef.current
+    if project.splittableAt(f) then
+      setSelectedClipId(None)
+      editProject(_.splitAt(f))
+
   def addAvTracks(): Unit =
     val n  = nextTrackNum
     val vt = Track(s"trkv-${System.nanoTime()}", s"V$n", MediaKind.Video)
@@ -1051,6 +1061,7 @@ private val App: Component[Session] = component[Session] { initial =>
     onRemoveLowerThird  = removeLowerThird,
     onAddTrack          = addTrack,
     onAddAvTracks       = () => addAvTracks(),
+    onSplit             = () => splitAtPlayhead(),
   ))
 
   // The editor body, Resolve-style: a top row of bin | player | inspector — split by draggable

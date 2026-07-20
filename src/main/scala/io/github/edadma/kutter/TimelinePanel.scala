@@ -37,6 +37,7 @@ private final case class TimelineProps(
     onRemoveLowerThird:  String => Unit,
     onAddTrack:          MediaKind => Unit,
     onAddAvTracks:       () => Unit,
+    onSplit:             () => Unit,
 )
 
 private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] { p =>
@@ -615,6 +616,7 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       selectedClipId match
         case Some(id) => p.onRemovePlacement(id)
         case None     => selectedId.foreach(p.onRemoveLowerThird)
+    else if e.scancode == Key.S then p.onSplit() // the razor: cut every clip at the playhead
 
   // The track panel: a card with the pinned ruler over a vertical scroll view of the track widgets, so
   // a tall stack scrolls while the ruler stays put. Each track is its own widget inside the panel rather
@@ -640,6 +642,8 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       // track stacks atop the video group; a new audio track goes below.
       box(bg = theme.background, padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
         row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
+          // The razor: cut every clip at the playhead (also the S key when the timeline has focus).
+          KutterUi.textButton(theme)("✂ Split", () => p.onSplit()),
           spacer(),
           KutterUi.textButton(theme)("+ A/V", () => p.onAddAvTracks()),
           KutterUi.textButton(theme)("+ Video", () => p.onAddTrack(MediaKind.Video)),

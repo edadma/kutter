@@ -505,6 +505,35 @@ private[kutter] object Diagnostics:
       check("title placement roundtrip", titleProj.toJson.fromJson[Project].map(_.tracks.head.clips.head.titleId), Right(Some("ttl")))
       check("titleFor resolves", titleProj.titleFor("ttl").map(_.name), Some("Name"))
 
+      // The razor: splitAt cuts every clip crossing the frame into two abutting halves, each keeping the
+      // source and its own window (the right half's in-point advances by the left's length so the source
+      // plays across the seam). A frame at an edge or in a gap splits nothing.
+      val splitClip = MediaClip.make("s.mp4", MediaKind.Video, 300)
+      val splitBase = Project.blank.copy(bin = List(splitClip),
+        tracks = List(io.github.edadma.kutter.Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(splitClip.id, 0, 200, inPoint = 30)))))
+      check("splittable inside", splitBase.splittableAt(80), true)
+      check("splittable at edge", splitBase.splittableAt(0), false)
+      check("splittable in gap", splitBase.splittableAt(250), false)
+      val splitDone = splitBase.splitAt(80)
+      check("split makes two", splitDone.tracks.head.clips.size, 2)
+      check("split left window", { val l = splitDone.tracks.head.clips.head; (l.timelineStart, l.length, l.inPoint) }, (0, 80, 30))
+      check("split right window", { val r = splitDone.tracks.head.clips(1); (r.timelineStart, r.length, r.inPoint) }, (80, 120, 110))
+      check("split no-op in gap", splitBase.splitAt(250).tracks.head.clips.size, 1)
+      // A linked A/V pair splits on both tracks; the left halves keep the original link, the right halves
+      // share one fresh link (so each side stays a locked pair).
+      val lk = Some("lk")
+      val splitLinked = Project.blank.copy(bin = List(splitClip), tracks = List(
+        io.github.edadma.kutter.Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(splitClip.id, 0, 200, link = lk))),
+        io.github.edadma.kutter.Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(splitClip.id, 0, 200, link = lk))),
+      )).splitAt(100)
+      check("split linked both tracks", (splitLinked.tracks.head.clips.size, splitLinked.tracks(1).clips.size), (2, 2))
+      check("split linked left keeps link", splitLinked.tracks.head.clips.head.link == splitLinked.tracks(1).clips.head.link, true)
+      check("split linked right shares new link", {
+        val rv = splitLinked.tracks.head.clips(1).link
+        val ra = splitLinked.tracks(1).clips(1).link
+        rv == ra && rv != lk && rv.isDefined
+      }, true)
+
       // Export settings: the container/codec validation and the avformat property mapping. The default is
       // a valid MP4 H.264/AAC; an invalid combination (H.264 in WebM, or AAC in WebM) is caught with a
       // message; switching container keeps a still-legal codec but snaps an illegal one to the container's

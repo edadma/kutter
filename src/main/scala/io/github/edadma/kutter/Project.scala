@@ -405,6 +405,42 @@ final case class Project(
           case None      => target.toList
       case None => Nil
 
+  /** Whether any placement on any track is crossed by `frame` — a clip the razor would cut there. */
+  def splittableAt(frame: Int): Boolean =
+    tracks.exists(_.clips.exists(pc => pc.timelineStart < frame && frame < pc.timelineEnd))
+
+  /** The project with every placement crossed by `frame` cut into two abutting placements — the razor at
+    * the playhead. Each half keeps the same source and its own window: the left runs from the original
+    * start up to `frame`, the right from `frame` to the original end, its in-point advanced by the left's
+    * length so the source plays continuously across the seam. A cut is silent (same generators), so it
+    * rides the live graph-swap rather than a re-open.
+    *
+    * A split linked A/V pair stays a locked pair on each side: the left halves keep the original link, and
+    * the right halves of one original link group share a fresh link id (so picture and sound on the right
+    * of the cut still move together). Splitting an unlinked clip yields two unlinked clips. A placement not
+    * crossed by `frame` is left untouched; a `frame` at a placement's edge does not split it. */
+  def splitAt(frame: Int): Project =
+    val rightLinks = scala.collection.mutable.Map.empty[String, String]
+    def rightLinkFor(l: String): String = rightLinks.getOrElseUpdate(l, s"lnk-${System.nanoTime()}-${rightLinks.size}")
+    var seq = 0
+    copy(tracks = tracks.map { t =>
+      t.copy(clips = t.clips.flatMap { pc =>
+        if pc.timelineStart < frame && frame < pc.timelineEnd then
+          seq += 1
+          val leftLen = frame - pc.timelineStart
+          val left    = pc.copy(length = leftLen)
+          val right   = pc.copy(
+            id            = s"pc-${System.nanoTime()}-$seq",
+            timelineStart = frame,
+            inPoint       = pc.inPoint + leftLen,
+            length        = pc.length - leftLen,
+            link          = pc.link.map(rightLinkFor),
+          )
+          List(left, right)
+        else List(pc)
+      })
+    })
+
   /** Write the project to `path` as pretty JSON. */
   def save(path: String): Unit =
     val w = new PrintWriter(new File(path))
