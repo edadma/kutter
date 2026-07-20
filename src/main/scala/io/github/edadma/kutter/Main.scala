@@ -959,6 +959,8 @@ private val App: Component[Session] = component[Session] { initial =>
     setSelectedLtId     = setSelectedId,
     focusProjectMonitor = () => focusProjectMonitor(),
     onDropClip          = onDropClip(_, _, _),
+    onRemovePlacement   = removePlacement,
+    onRemoveLowerThird  = removeLowerThird,
   ))
 
   // The editor body, Resolve-style: a top row of bin | player | inspector — split by draggable

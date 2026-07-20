@@ -33,6 +33,8 @@ private final case class TimelineProps(
     setSelectedLtId:     Option[String] => Unit,
     focusProjectMonitor: () => Unit,
     onDropClip:          (String, String, Int) => Unit,
+    onRemovePlacement:   String => Unit,
+    onRemoveLowerThird:  String => Unit,
 )
 
 private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] { p =>
@@ -671,10 +673,22 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       ),
     )
 
+  // Delete or Backspace removes the current selection from the timeline — the selected clip (with its
+  // linked partner), or else the selected lower third. The panel is focusable and a press anywhere in it
+  // takes focus (pointer focus climbs to the nearest focusable ancestor), so clicking a clip both selects
+  // it and focuses the panel; the key then reaches here. A text field editing an overlay's words keeps its
+  // own focus, so Backspace there still edits text rather than deleting a clip.
+  def onKey(e: KeyEvent): Unit =
+    if e.scancode == Key.Delete || e.scancode == Key.Backspace then
+      selectedClipId match
+        case Some(id) => p.onRemovePlacement(id)
+        case None     => selectedId.foreach(p.onRemoveLowerThird)
+
   // The track panel: a card with the pinned ruler over a vertical scroll view of the track widgets, so
   // a tall stack scrolls while the ruler stays put. Each track is its own widget inside the panel rather
   // than one canvas painting them all.
-  KutterUi.panel(theme)(1)(
+  box(flex = 1, focusable = true, onKeyDown = onKey)(
+   KutterUi.panel(theme)(1)(
     col(crossAxisAlignment = CrossAxisAlignment.Stretch)(
       ruler,
       box(flex = 1)(
@@ -688,5 +702,6 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
         ),
       ),
     ),
+   ),
   )
 }
