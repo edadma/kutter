@@ -1,5 +1,7 @@
 package io.github.edadma.kutter
 
+import java.io.File
+
 import io.github.edadma.mlt.Mlt
 import io.github.edadma.suit.Color
 import scala.io.Source
@@ -103,7 +105,7 @@ private[kutter] object Diagnostics:
         Mlt.init()
         val out  = sys.env.getOrElse("KUTTER_AUDIO_OUT", "/tmp/kutter-audio-out.wav")
         val mode = sys.env.getOrElse("KUTTER_AUDIO_MODE", "graph")
-        val len  = Player.mediaLength(src)
+        val len  = Player.mediaLength(src, TimelineSpec.default)
         val clip = MediaClip.make(src, MediaKind.Audio, len)
         val proj = mode match
           case "twoclip" =>
@@ -121,7 +123,7 @@ private[kutter] object Diagnostics:
             // Mimic the project monitor: a video clip composited on V1, the tone mixed on A1, and three
             // lower-third card composites — the graph shape the interference appears in.
             val vsrc  = sys.env.getOrElse("KUTTER_AUDIO_VIDEO", "big_buck_bunny_720p.mp4")
-            val vlen  = Player.mediaLength(vsrc)
+            val vlen  = Player.mediaLength(vsrc, TimelineSpec.default)
             val vclip = MediaClip.make(vsrc, MediaKind.Video, vlen)
             Project.blank.copy(
               bin = List(clip, vclip),
@@ -278,6 +280,27 @@ private[kutter] object Diagnostics:
       check("body card width", bw, 480)
       check("body card argb32", bargb, true)
 
+      // The timeline spec — the frame rate as an exact rational, the fps derived back, and the
+      // NTSC-fractional mapping (29.97 = 30000/1001, 23.976 = 24000/1001) versus the whole rates.
+      check("spec default size", (TimelineSpec.default.width, TimelineSpec.default.height), (1280, 720))
+      check("spec default fps", TimelineSpec.default.fps, 30.0)
+      check("spec fps rational", f"${TimelineSpec(fpsNum = 30000, fpsDen = 1001).fps}%.3f", "29.970")
+      check("fromFps 30", (TimelineSpec.fromFps(30.0).fpsNum, TimelineSpec.fromFps(30.0).fpsDen), (30, 1))
+      check("fromFps 29.97", (TimelineSpec.fromFps(29.97).fpsNum, TimelineSpec.fromFps(29.97).fpsDen), (30000, 1001))
+      check("fromFps 23.976", (TimelineSpec.fromFps(23.976).fpsNum, TimelineSpec.fromFps(23.976).fpsDen), (24000, 1001))
+      check("fromFps 24", (TimelineSpec.fromFps(24.0).fpsNum, TimelineSpec.fromFps(24.0).fpsDen), (24, 1))
+
+      // Auto-adopt gate: a fresh project adopts the first clip's spec; once a spec is pinned (an
+      // explicit setting) or the bin holds a clip, it stops. And `withSpec` pins and sets the format.
+      check("adopt fresh", Project.blank.shouldAdoptSpec, true)
+      check("adopt after clip", videoProject("clip.mp4", 30).shouldAdoptSpec, false)
+      check("adopt after withSpec", Project.blank.withSpec(TimelineSpec(1920, 1080, 24, 1)).shouldAdoptSpec, false)
+      check("withSpec sets format", Project.blank.withSpec(TimelineSpec(1920, 1080, 24, 1)).spec.width, 1920)
+
+      // The creation date is an ISO YYYY-MM-DD (10 chars, dashes at 5 and 8) — the scala-java-time path.
+      check("today iso length", Project.today.length, 10)
+      check("today iso dashes", (Project.today.charAt(4), Project.today.charAt(7)), ('-', '-'))
+
       // The fixed-track model: a blank project has the empty default tracks (V1, A1), no clips on them,
       // and no overlays; a placement lands a bin clip on a track. Cover the model's shape and that a
       // session with edits survives the JSON round-trip the cache store uses.
@@ -422,6 +445,40 @@ private[kutter] object Diagnostics:
       Player.probe(proj, f, "probe-nle.png")
       Mlt.close()
       println(s"fixed-track render (frame $f) wrote probe-nle.png")
+      return true
+
+    // `KUTTER_PROBE_EXPORT` runs the real export path — `Player.startRender` encoding a short
+    // fixed-track project (a video clip on V1, its audio on A1, a lower third on top) to an H.264/AAC
+    // mp4, polled to completion exactly as the GUI does. It checks that the render job runs and finishes
+    // and that a non-trivial file lands on disk — the whole timeline-to-video pipeline off the GUI.
+    // Output path from `KUTTER_EXPORT_OUT` (default probe-export.mp4).
+    if sys.env.contains("KUTTER_PROBE_EXPORT") then
+      Mlt.init()
+      val out  = sys.env.getOrElse("KUTTER_EXPORT_OUT", "probe-export.mp4")
+      val src  = "big_buck_bunny_720p.mp4"
+      val spec = Player.probeSpec(src)
+      val len  = math.min(60, Player.mediaLength(src, spec)) // a short clip keeps the encode quick
+      val clip = MediaClip.make(src, MediaKind.Video, len)
+      val proj = Project.blank.withSpec(spec).copy(
+        bin = List(clip),
+        tracks = List(
+          Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(clip.id, 0, len, link = Some("k")))),
+          Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len, link = Some("k")))),
+        ),
+        lowerThirds = List(LowerThird("t", "Exported", "from the timeline", 0, math.max(1, len - 1))),
+      )
+      val job = Player.startRender(proj, out)
+      var waited = 0
+      while !job.isDone && waited < 60000 do Thread.sleep(50); waited += 50
+      val done = job.isDone
+      job.finish()
+      Mlt.close()
+      val f    = new File(out)
+      val size = if f.exists() then f.length() else 0L
+      println(f"export ${spec.width}x${spec.height}@${spec.fps}%.3f, $len frames -> $out")
+      println(s"  finished=$done  exists=${f.exists()}  bytes=$size")
+      if !done || !f.exists() || size < 1024 then { println("EXPORT PROBE FAILED"); sys.exit(1) }
+      println("EXPORT PROBE OK")
       return true
 
     false

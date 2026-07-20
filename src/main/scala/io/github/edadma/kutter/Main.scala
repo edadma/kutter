@@ -166,6 +166,28 @@ private val App: Component[Session] = component[Session] { initial =>
   // until the user confirms it in the dialog.
   val (confirm, setConfirm, _) = useState[Option[ConfirmSpec]](None)
 
+  // The project-settings dialog: whether it is open, and the staged values it edits — name, creation
+  // date, and the timeline format (resolution, frame rate, audio rate). They are drafts so the dialog
+  // can be filled and cancelled without touching the project, and a spec change (which re-opens the
+  // player against a new profile) happens once on Apply rather than on every keystroke. Seeded from the
+  // project when the dialog opens.
+  val (settingsOpen, setSettingsOpen, _) = useState(false)
+  val (dfName, setDfName, _)     = useState("")
+  val (dfCreated, setDfCreated, _) = useState("")
+  val (dfW, setDfW, _)           = useState(1280)
+  val (dfH, setDfH, _)           = useState(720)
+  val (dfFpsN, setDfFpsN, _)     = useState(30)
+  val (dfFpsD, setDfFpsD, _)     = useState(1)
+  val (dfAudio, setDfAudio, _)   = useState(48000)
+
+  // A running video export: whether one is in progress, its 0..1 progress for the bar, and the job it
+  // polls plus the path it is writing (refs — the poll reads them imperatively). A poll advances the
+  // progress and finishes the job when the encode completes; see the export effect below.
+  val (exporting, setExporting, _)             = useState(false)
+  val (exportProgress, setExportProgress, _)   = useState(0.0)
+  val exportJob = useRef[Player.RenderJob | Null](null)
+  val exportOut = useRef("")
+
   // The video layer, once the player has opened the project and created its texture. Null until the
   // mount effect runs, so the first render shows a placeholder rather than an empty hole.
   val (layer, setLayer, _) = useState[VideoLayer | Null](null)
@@ -294,6 +316,25 @@ private val App: Component[Session] = component[Session] { initial =>
     33,
   )
 
+  // Advance a running export. The encode runs on MLT's own threads; this poll reads how far it has got
+  // for the progress bar, and when it finishes frees the job and shows a completion notice. Reads only
+  // refs and stable setters, so the constant-deps interval closure stays correct. A cheap no-op when no
+  // export is running.
+  useInterval(
+    () =>
+      exportJob.current match
+        case job: Player.RenderJob =>
+          if job.isDone then
+            job.finish()
+            exportJob.current = null
+            setExporting(false)
+            setExportProgress(1.0)
+            setConfirm(Some(ConfirmSpec("Export complete", s"Wrote ${exportOut.current}.", "OK", () => ())))
+          else setExportProgress(job.position.toDouble / math.max(1, job.totalFrames))
+        case null => (),
+    200,
+  )
+
   // A project has something to play — and so wants a player and preview — once it has media on a track
   // or any lower thirds. A titles-only project previews over a black background (see
   // `Player.buildGraph`), so a texish card can be checked before any footage is placed.
@@ -316,14 +357,15 @@ private val App: Component[Session] = component[Session] { initial =>
   // A one-clip project for the clip monitor: a video clip previews as its linked A/V pair (picture over
   // its own sound), an audio clip on an audio track alone (the preview is black, the sound plays).
   def clipMonitorProject(clip: MediaClip): Project =
-    val len = math.max(1, if clip.frames > 0 then clip.frames else Player.mediaLength(clip.path))
-    clip.kind match
+    val len = math.max(1, if clip.frames > 0 then clip.frames else Player.mediaLength(clip.path, project.spec))
+    val base = clip.kind match
       case MediaKind.Video => Diagnostics.videoProject(clip.path, len)
       case MediaKind.Audio =>
         Project.blank.copy(
           bin = List(clip),
           tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len)))),
         )
+    base.copy(spec = project.spec) // preview the clip conformed to the timeline it will sit on
 
   // Tear down the clip monitor's player and texture and drop its refs. Safe to call when none is open.
   def closeClipPlayer(): Unit =
@@ -469,6 +511,17 @@ private val App: Component[Session] = component[Session] { initial =>
   def editLt(id: String, f: LowerThird => LowerThird): Unit =
     editProject(p => p.copy(lowerThirds = p.lowerThirds.map(lt => if lt.id == id then f(lt) else lt)))
 
+  // Open the project-settings dialog, seeding its drafts from the current project.
+  def openSettings(): Unit =
+    setDfName(project.name)
+    setDfCreated(project.created)
+    setDfW(project.spec.width)
+    setDfH(project.spec.height)
+    setDfFpsN(project.spec.fpsNum)
+    setDfFpsD(project.spec.fpsDen)
+    setDfAudio(project.spec.audioRate)
+    setSettingsOpen(true)
+
   def toggle(): Unit =
     activePlayer() match
       case p: Player =>
@@ -487,7 +540,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // rate is the profile's.
   val (contentReach, fps) = playerRef.current match
     case p: Player => (math.max(p.totalFrames, projectExtent), p.fps)
-    case null      => (math.max(DefaultTimelineFrames, projectExtent), 30.0)
+    case null      => (math.max(DefaultTimelineFrames, projectExtent), project.spec.fps)
 
   // The timeline's length: the content plus a tail of empty space, so a clip can always be slid right
   // (opening a gap before it for an intro) and a drop near the end has room. The tail grows with the
@@ -1021,6 +1074,62 @@ private val App: Component[Session] = component[Session] { initial =>
     setProject(p)
     setPath(boundPath)
 
+  // Apply the settings drafts. A change to the timeline format (resolution, frame rate, or audio rate)
+  // re-opens the player against the new profile — the texture, audio device, and graph are all tied to
+  // it — and refits the view; a name/date-only change rides the ordinary edit path. The frame rate can
+  // only differ here when the timeline had no content (the dialog locks it otherwise), so no placed clip
+  // needs its frame counts remapped.
+  def applySettings(): Unit =
+    setSettingsOpen(false)
+    val newSpec = TimelineSpec(dfW, dfH, dfFpsN, dfFpsD, dfAudio)
+    val newName = dfName.trim match { case "" => "Untitled"; case s => s }
+    val renamed = project.copy(name = newName, created = dfCreated.trim)
+    if newSpec != project.spec then
+      dirty.current = true
+      resetView()
+      reopen(renamed.withSpec(newSpec), path)
+    else if renamed.name != project.name || renamed.created != project.created then
+      editProject(_ => renamed)
+
+  // Export the timeline to a video file. Nothing to render on an empty timeline, so that is a gentle
+  // notice; otherwise a save dialog picks the path and the encode begins.
+  val exportFilter = Seq(FileDialog.Filter("Video", "mp4;mov"))
+
+  def requestExport(): Unit =
+    if !hasContent(project) then
+      setConfirm(Some(ConfirmSpec("Nothing to export",
+        "Place some media or a lower third on the timeline before exporting a video.", "OK", () => ())))
+    else
+      FileDialog.save(filters = exportFilter, defaultLocation = s"${project.name}.mp4", title = "Export video") {
+        case FileDialog.Result.Chosen(paths) => startExport(paths.head)
+        case _                               => ()
+      }
+
+  // Begin encoding `outPath` (forcing a video extension). Playback is paused first so the export owns
+  // the machine, then the render job is started and the progress dialog opens; the poll above advances
+  // and finishes it. Producer creation is on this (UI/main) thread, as MLT requires.
+  def startExport(outPath: String): Unit =
+    val out = if outPath.endsWith(".mp4") || outPath.endsWith(".mov") then outPath else s"$outPath.mp4"
+    playerRef.current match
+      case p: Player => p.pause(); setPlaying(false)
+      case null      => ()
+    try
+      exportOut.current = out
+      exportJob.current = Player.startRender(project, out)
+      setExportProgress(0.0)
+      setExporting(true)
+    catch
+      case e: Throwable =>
+        setConfirm(Some(ConfirmSpec("Export failed", Option(e.getMessage).getOrElse(e.toString), "OK", () => ())))
+
+  // Cancel a running export: stop and free the job (leaving whatever was written so far on disk).
+  def cancelExport(): Unit =
+    exportJob.current match
+      case job: Player.RenderJob => job.finish()
+      case null                  => ()
+    exportJob.current = null
+    setExporting(false)
+
   // The media-file filters for importing a clip into the bin.
   val videoFilter = Seq(FileDialog.Filter("Video", "mp4;mov;m4v;mkv;webm;avi"))
   val audioFilter = Seq(FileDialog.Filter("Audio", "mp3;wav;m4a;aac;flac;ogg"))
@@ -1042,16 +1151,25 @@ private val App: Component[Session] = component[Session] { initial =>
   // arbitrary track position, and unlinking a pair, come with the timeline UI.
   def importClip(pathStr: String, kind: MediaKind): Unit =
     dirty.current = true
-    val len      = Player.mediaLength(pathStr)
+    // A first video clip into a fresh project sets the timeline format from its own (auto-adopt); later
+    // clips — and audio clips, which carry no video format to adopt — are conformed to whatever the
+    // timeline already is. The audio rate is never adopted (resampling is transparent), so the project's
+    // is kept. Measuring the clip's length happens against the resulting spec, so the length is in
+    // timeline frames.
+    val base =
+      if kind == MediaKind.Video && project.shouldAdoptSpec then
+        project.withSpec(Player.probeSpec(pathStr).copy(audioRate = project.spec.audioRate))
+      else project
+    val len      = Player.mediaLength(pathStr, base.spec)
     val clip     = MediaClip.make(pathStr, kind, len)
-    val withClip = project.copy(bin = project.bin :+ clip)
+    val withClip = base.copy(bin = base.bin :+ clip)
     val placed = kind match
       case MediaKind.Video =>
         val link = Some(s"lnk-${System.nanoTime()}")
-        val onV  = project.videoTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, link)).getOrElse(withClip)
-        project.audioTracks.headOption.map(t => appendTo(onV, t.id, clip, len, link)).getOrElse(onV)
+        val onV  = base.videoTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, link)).getOrElse(withClip)
+        base.audioTracks.headOption.map(t => appendTo(onV, t.id, clip, len, link)).getOrElse(onV)
       case MediaKind.Audio =>
-        project.audioTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, None)).getOrElse(withClip)
+        base.audioTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, None)).getOrElse(withClip)
     reopen(placed, path)
 
   def doImportVideo(): Unit =
@@ -1096,7 +1214,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // generators, so this re-opens the player, as importing does. Nothing happens when the playhead has no
   // room (a length of 0). The source length is measured against the profile, so on the UI/main thread.
   def placeAtPlayhead(clip: MediaClip): Unit =
-    val srcLen = Player.mediaLength(clip.path)
+    val srcLen = Player.mediaLength(clip.path, project.spec)
     clip.kind match
       case MediaKind.Video =>
         (project.videoTracks.headOption, project.audioTracks.headOption) match
@@ -1240,11 +1358,14 @@ private val App: Component[Session] = component[Session] { initial =>
   // Open/Save/Import act on the project as a whole. Selecting a lower-third row drives the inspector.
   val binPanel = titledPanel("Bin")(
     col(crossAxisAlignment = CrossAxisAlignment.Stretch, spacing = 10)(
-      // Project actions: start over, open/save a `.kutter`.
+      // Project actions: start over, open/save a `.kutter`, project settings, export a video.
       row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
         textButton("New", () => requestNew()),
         textButton("Open", () => doOpen()),
         textButton("Save", () => doSave()),
+        textButton("Settings", () => openSettings()),
+        spacer(),
+        textButton("Export", () => requestExport()),
       ),
       // Media section: the imported clips (video and audio), each removable, with import actions — a
       // project can hold several videos (composited on video tracks) and several audio clips (mixed).
@@ -1673,6 +1794,80 @@ private val App: Component[Session] = component[Session] { initial =>
       ),
     )
 
+  // The project-settings dialog. Resolution/frame-rate/audio-rate are dropdowns of the common choices
+  // (with the current value added when it is not one of them, e.g. an auto-adopted odd size). The frame
+  // rate is the edit's clock, so it is only editable while the timeline is empty — once there is
+  // content it shows read-only, because changing it would reinterpret every clip's position in time.
+  val fpsLocked = hasContent(project)
+  val dfFps     = dfFpsN.toDouble / math.max(1, dfFpsD)
+  val dfFpsText = if math.abs(dfFps - math.rint(dfFps)) < 1e-6 then dfFps.toInt.toString else f"$dfFps%.2f"
+  val sizeVal   = s"${dfW}x${dfH}"
+  val sizeOpts  =
+    val base = TimelineSpec.sizeChoices.map((label, w, h) => (s"${w}x${h}", label))
+    if base.exists(_._1 == sizeVal) then base else (sizeVal, s"${dfW}×${dfH} (current)") +: base
+  val rateVal  = s"${dfFpsN}/${dfFpsD}"
+  val rateOpts =
+    val base = TimelineSpec.rateChoices.map((label, n, d) => (s"$n/$d", s"$label fps"))
+    if base.exists(_._1 == rateVal) then base else (rateVal, s"$dfFpsText fps (current)") +: base
+  val audioOpts = TimelineSpec.audioRateChoices.map(r => (r.toString, s"$r Hz"))
+
+  val settingsDialog =
+    Dialog(open = settingsOpen, onClose = () => setSettingsOpen(false), width = 440)(
+      sizedBox(width = 396)(
+        col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 14)(
+          text("Project Settings", size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
+          labeled("Name")(TextField(dfName, setDfName)),
+          labeled("Created")(TextField(dfCreated, setDfCreated)),
+          labeled("Resolution")(
+            Select(sizeOpts, sizeVal, v => v.split("x") match
+              case Array(w, h) => w.toIntOption.foreach(setDfW); h.toIntOption.foreach(setDfH)
+              case _           => (),
+            width = 372),
+          ),
+          if fpsLocked then
+            labeled("Frame rate")(
+              col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 3)(
+                text(s"$dfFpsText fps", size = 13, color = theme.surfaceText, mono = true),
+                text("Locked — the frame rate is the edit's clock. Clear the timeline to change it.",
+                  size = 11, color = theme.border, maxLines = 0),
+              ),
+            )
+          else
+            labeled("Frame rate")(
+              Select(rateOpts, rateVal, v => v.split("/") match
+                case Array(n, d) => n.toIntOption.foreach(setDfFpsN); d.toIntOption.foreach(setDfFpsD)
+                case _           => (),
+              width = 372),
+            ),
+          labeled("Audio rate")(
+            Select(audioOpts, dfAudio.toString, v => v.toIntOption.foreach(setDfAudio), width = 372),
+          ),
+          row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
+            spacer(),
+            textButton("Cancel", () => setSettingsOpen(false)),
+            textButton("Apply", () => applySettings()),
+          ),
+        ),
+      ),
+    )
+
+  // The export-progress dialog: a determinate bar over the encode, not dismissable by the scrim (the
+  // export is running behind it), with a Cancel that stops it.
+  val exportDialog =
+    Dialog(open = exporting, onClose = () => (), maskClosable = false, width = 380)(
+      sizedBox(width = 336)(
+        col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 16)(
+          text("Exporting video…", size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
+          text(s"${math.round(exportProgress * 100)}%", size = 13, color = theme.border, mono = true),
+          ProgressBar(exportProgress),
+          row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
+            spacer(),
+            textButton("Cancel", () => cancelExport()),
+          ),
+        ),
+      ),
+    )
+
   ThemeProvider(theme)(
     box(bg = theme.background, padding = EdgeInsets.all(8))(
       splitter(axis = Axis.Vertical, initial = 0.6, min = 0.35, max = 0.9)(
@@ -1680,6 +1875,8 @@ private val App: Component[Session] = component[Session] { initial =>
         trackPanel,
       ),
       confirmDialog,
+      settingsDialog,
+      exportDialog,
     ),
   )
 }
@@ -1722,7 +1919,11 @@ private val App: Component[Session] = component[Session] { initial =>
       case Some(mediaArg) =>
         SessionStore.load()
           .filter(_.project.bin.exists(_.path == mediaArg))
-          .getOrElse(Session(Diagnostics.videoProject(mediaArg, Player.mediaLength(mediaArg)), None))
+          .getOrElse {
+            // A bare media argument starts a fresh project that adopts the clip's own format.
+            val spec = Player.probeSpec(mediaArg)
+            Session(Diagnostics.videoProject(mediaArg, Player.mediaLength(mediaArg, spec)).withSpec(spec), None)
+          }
       case None =>
         SessionStore.load().getOrElse(Session(Project.blank, None))
 

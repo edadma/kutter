@@ -7,3 +7,5 @@ target/
 *.log
 .DS_Store
 probe*.png
+probe*.mp4
+probe*.wav

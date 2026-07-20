@@ -38,6 +38,9 @@ lazy val app = project
     ),
     // logger is stable and published; the co-developed libraries come from the ProjectRefs above.
     libraryDependencies += "io.github.edadma" %%% "logger" % "0.0.11",
+    // scala-java-time provides java.time on Scala Native (the platform's own support is uneven), for
+    // the project's creation date. Only fixed-offset use (UTC), so no timezone database is needed.
+    libraryDependencies += "io.github.cquiroz" %%% "scala-java-time" % "2.7.0",
     // The project file — media, lower thirds, styles — is serialized as JSON. zio-json derives the
     // codecs and is verified to link and round-trip on Scala Native.
     libraryDependencies += "dev.zio" %%% "zio-json" % "0.7.3",

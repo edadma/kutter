@@ -8,24 +8,16 @@ import io.github.edadma.suit.{UiThread, VideoTexture}
 import io.github.edadma.sdl3.{AudioStream, initAudio, openAudioStream}
 import io.github.edadma.logger.LoggerFactory
 
-// The audio device format kutter asks MLT to resample every clip to: 48kHz stereo float32, which is
-// what SDL's audio stream takes. A byte-frame (one sample across both channels) is 8 bytes.
-private val AudioRate           = 48000
+// The audio channel layout kutter asks MLT to resample every clip to: stereo float32, which is what
+// SDL's audio stream takes. A byte-frame (one sample across both channels) is 8 bytes. The sample
+// *rate* is per-project (the timeline spec's `audioRate`), not fixed here — resampling is transparent,
+// so it is a setting rather than a constant.
 private val AudioChannels       = 2
 private val AudioBytesPerSample = AudioChannels * 4
 
-// How much audio (per channel) to keep buffered ahead of the picture at the device — a quarter second.
-// The decoder runs ahead to maintain this reserve, and each decoded picture is shown when its audio
-// actually reaches the speakers, so the reserve deepens the buffer without pushing sound out of sync
-// with the picture. It is what lets a GC pause or a heavy render frame pass without starving the device
-// (the cause of clicks/pulsing on a shallow one-frame buffer). Audio is the clock: a dropped or repeated
-// picture goes unnoticed, but a gap in the sound is heard.
-private val AudioLeadSamples  = AudioRate / 4
 private val MaxBufferedFrames = 24 // safety cap on decoded frames held ahead, so a stall can't grow it unbounded
 
-// The playback profile the graph renders against, and the filmstrip the timeline shows: a spread of
-// small 16:9 thumbnails decoded once when a video track opens.
-private val ProfileName = "atsc_720p_30"
+// The filmstrip the timeline shows: a spread of small 16:9 thumbnails decoded once when a video track opens.
 private val ThumbCount  = 24
 private val ThumbWidth  = 160
 private val ThumbHeight = 90
@@ -53,6 +45,7 @@ private val ThumbHeight = 90
 // the UI thread while the decode thread fills it.
 final class Player(
     profile:  Profile,
+    audioRate: Int,
     initialGraph:     Producer,
     consumer: Consumer,
     texture:  VideoTexture,
@@ -63,6 +56,14 @@ final class Player(
     initialCloseGraph: () => Unit,
 ):
   private val log = LoggerFactory.getLogger
+
+  // How much audio (per channel) to keep buffered ahead of the picture at the device — a quarter
+  // second at the project's sample rate. The decoder runs ahead to maintain this reserve, and each
+  // decoded picture is shown when its audio actually reaches the speakers, so the reserve deepens the
+  // buffer without pushing sound out of sync with the picture. It is what lets a GC pause or a heavy
+  // render frame pass without starving the device (the cause of clicks/pulsing on a shallow one-frame
+  // buffer). Audio is the clock: a dropped or repeated picture goes unnoticed, but a gap is heard.
+  private val audioLeadSamples = audioRate / 4
 
   // The graph the consumer pulls and the teardown that frees it. They are vars, not constructor vals,
   // because editing the timeline (a lower third, a clip's position) rebuilds the graph in place (see
@@ -335,7 +336,7 @@ final class Player(
           uploadFrame(frame)
           true
 
-  /** One turn of playback. The decoder runs ahead to keep `AudioLeadSamples` buffered at the device, then
+  /** One turn of playback. The decoder runs ahead to keep `audioLeadSamples` buffered at the device, then
     * every decoded frame whose audio has reached the speakers is shown. Audio is the clock: the picture
     * follows it, and the buffered reserve absorbs a GC pause or a heavy render frame that would otherwise
     * starve the device and click. Returns false once the timeline has ended and every buffered frame has
@@ -344,7 +345,7 @@ final class Player(
     // Fill: decode ahead until the reserve is deep enough (or the queue cap, the end, or an interruption).
     var filling = true
     while filling && !reachedEnd && !stopping && playing && seekTo < 0 &&
-      displayQueue.size < MaxBufferedFrames && (pushedSamples - audioPlayed()) < AudioLeadSamples do
+      displayQueue.size < MaxBufferedFrames && (pushedSamples - audioPlayed()) < audioLeadSamples do
       consumer.rtFrame() match
         case None => filling = false // MLT produced nothing right now; stop filling this pass
         case Some(f) =>
@@ -352,7 +353,7 @@ final class Player(
             f.close()
             reachedEnd = true // end of timeline; drain what is queued, then stop
           else
-            val a           = f.audio(fps, AudioRate, AudioChannels)
+            val a           = f.audio(fps, audioRate, AudioChannels)
             val startSample = pushedSamples
             if a.samples > 0 then
               if !hasAudio then
@@ -400,12 +401,34 @@ object Player:
       close:         () => Unit,
   )
 
-  /** Open `project` against a 720p30 graph and build a paused player, the video texture that shows it,
-    * and the audio stream that voices it. Runs on the UI thread (the texture needs the runtime's
-    * renderer, and the audio device is brought up here after SDL is initialised).
+  /** The MLT profile a `spec` renders against — a custom, square-pixel, progressive profile at its
+    * exact geometry and rational frame rate. Every place that builds a graph for a project (play,
+    * export, a length probe) goes through this, so one project renders against one profile everywhere. */
+  private[kutter] def profileFor(spec: TimelineSpec): Profile =
+    Profile.custom(spec.width, spec.height, spec.fpsNum, spec.fpsDen)
+
+  /** The native video format of the source at `path`, as a `TimelineSpec` — its own resolution and
+    * frame rate, read by letting a throwaway profile adopt the producer's format. This is what a fresh
+    * project auto-adopts from its first clip, so the timeline matches the footage without the user
+    * choosing. Creates a producer, so it must run on the main thread and after `Mlt.init()`. The
+    * audio rate is left at the default (resampling is transparent, so it is not adopted). */
+  def probeSpec(path: String): TimelineSpec =
+    val profile = Profile.default
+    val p       = Producer(profile, path)
+    profile.adoptFormatOf(p)
+    val spec =
+      TimelineSpec(profile.width, profile.height, profile.frameRateNum, math.max(1, profile.frameRateDen))
+    p.close()
+    profile.close()
+    spec
+
+  /** Open `project` and build a paused player, the video texture that shows it, and the audio stream
+    * that voices it. Runs on the UI thread (the texture needs the runtime's renderer, and the audio
+    * device is brought up here after SDL is initialised).
     *
-    * The project is rendered against a fixed 1280x720@30 profile and its audio resampled to 48kHz
-    * stereo: MLT normalises every producer's output to these, so differently shaped sources still play.
+    * The project renders against its own timeline spec (`profileFor`): MLT normalises every producer's
+    * output to that resolution, frame rate, and — resampled — audio rate, so differently shaped sources
+    * are conformed and still play.
     *
     * Playback runs a **tractor** — a multitrack timeline that is itself a producer, so the decode
     * loop, seeking, and A/V sync are unchanged. Each project track is a playlist sequencing its clips;
@@ -413,7 +436,8 @@ object Player:
     * track of its own, a full-frame card composited on top and faded in and out over its window. */
   def open(project: Project): (Player, VideoTexture) =
     val log     = LoggerFactory.getLogger
-    val profile = Profile(ProfileName)
+    val spec    = project.spec
+    val profile = profileFor(spec)
 
     val built = buildGraph(profile, project)
 
@@ -436,9 +460,9 @@ object Player:
     )
 
     initAudio()
-    val audio = openAudioStream(AudioRate, AudioChannels)
+    val audio = openAudioStream(spec.audioRate, AudioChannels)
     log.info(
-      s"audio device ${if audio.isNull then "FAILED to open" else "open"} @ ${AudioRate}Hz ${AudioChannels}ch",
+      s"audio device ${if audio.isNull then "FAILED to open" else "open"} @ ${spec.audioRate}Hz ${AudioChannels}ch",
       category = "player",
     )
 
@@ -453,7 +477,7 @@ object Player:
     for track <- project.videoTracks; pc <- track.ordered; clip <- project.clipFor(pc.clipId) do
       if !thumbCache.contains(clip.path) then
         val t = new Thumbnails(ThumbCount, ThumbWidth, ThumbHeight)
-        t.start(ProfileName, clip.path)
+        t.start(spec, clip.path)
         thumbCache(clip.path) = t
 
     // A waveform spans the whole source (like the filmstrip), so a trimmed placement can show exactly
@@ -463,12 +487,12 @@ object Player:
     for track <- project.audioTracks; pc <- track.ordered; clip <- project.clipFor(pc.clipId) do
       if !waveCache.contains(clip.path) then
         val w = new Waveform(math.max(1, if clip.frames > 0 then clip.frames else pc.length))
-        w.start(ProfileName, clip.path, profile.fps)
+        w.start(spec, clip.path)
         waveCache(clip.path) = w
 
     val player =
-      new Player(profile, built.tractor, consumer, texture, audio, thumbCache.toMap, waveCache.toMap,
-        built.volumeFilters, built.close)
+      new Player(profile, spec.audioRate, built.tractor, consumer, texture, audio, thumbCache.toMap,
+        waveCache.toMap, built.volumeFilters, built.close)
     player.setVolume(project.master) // the project's master fader drives the audio device gain
     (player, texture)
 
@@ -657,13 +681,13 @@ object Player:
     * to its end with a non-realtime avformat consumer (float PCM, 48kHz stereo), so a steady tone in the
     * source comes out as whatever the tractor's mix actually produces. A debug tool, not a playback path. */
   def renderAudio(project: Project, out: String): Unit =
-    val profile  = Profile(ProfileName)
+    val profile  = profileFor(project.spec)
     val built    = buildGraph(profile, project)
     val consumer = Consumer(profile, "avformat", Some(out))
     consumer.realTime        = 0    // process as fast as possible, drop nothing
     consumer.terminateOnPause = true // stop when the timeline ends (base track's speed hits 0)
     consumer.set("acodec", "pcm_f32le") // lossless float PCM so the envelope is exact
-    consumer.set("frequency", AudioRate.toString)
+    consumer.set("frequency", project.spec.audioRate.toString)
     consumer.set("channels", AudioChannels.toString)
     consumer.set("vn", "1")             // audio only
     consumer.connect(built.tractor)
@@ -674,11 +698,58 @@ object Player:
     built.close()
     profile.close()
 
-  /** The length in frames a clip at `path` runs to, against the playback profile — what a full-length
-    * placement of a freshly imported clip is sized to. Creates a producer, so it must run on the main
-    * thread (the loader reaches macOS APIs that throw off it) and after `Mlt.init()`. */
-  def mediaLength(path: String): Int =
-    val profile = Profile(ProfileName)
+  /** A running video export: an avformat consumer encoding a project's graph to a file. The consumer
+    * spawns its own MLT worker threads, so once `startRender` has kicked it off nothing blocks — the
+    * caller polls `position`/`isDone` and calls `finish` when it is done (or to cancel). Progress is a
+    * frame count against `totalFrames`. */
+  final class RenderJob private[Player] (profile: Profile, consumer: Consumer, built: BuildResult):
+    /** The total number of frames the export writes — the timeline length. */
+    val totalFrames: Int = built.length
+
+    /** The number of frames written so far, clamped to the total. */
+    def position: Int = math.max(0, math.min(totalFrames, consumer.position))
+
+    /** Whether the encode has finished (the timeline reached its end) or otherwise stopped. */
+    def isDone: Boolean = consumer.isStopped
+
+    /** Stop encoding if it is still running and free the graph, consumer, and profile. Call once, when
+      * `isDone` is true or to cancel a still-running export. */
+    def finish(): Unit =
+      consumer.stop()
+      consumer.close()
+      built.close()
+      profile.close()
+
+  /** Start exporting `project` to the video file `out`, encoded H.264/AAC in the container the path's
+    * extension names, against the project's own timeline spec. Returns at once with a [[RenderJob]] to
+    * poll — the encode runs on MLT's worker threads. **Must run on the main thread**: it builds the
+    * graph, and MLT producer creation is main-thread-only. A constant-quality (CRF 20) encode, a
+    * sensible default; explicit bitrate/codec choices can layer on later. */
+  def startRender(project: Project, out: String): RenderJob =
+    val profile  = profileFor(project.spec)
+    val built    = buildGraph(profile, project)
+    val consumer = Consumer(profile, "avformat", Some(out))
+    consumer.realTime         = 0    // encode as fast as the machine allows, dropping nothing
+    consumer.terminateOnPause = true // stop when the base track's speed hits 0 (the timeline's end)
+    consumer.set("vcodec", "libx264")
+    consumer.set("crf", "20")              // constant quality — visually near-lossless, sensible size
+    consumer.set("acodec", "aac")
+    consumer.set("ab", "192k")             // audio bitrate
+    consumer.set("frequency", project.spec.audioRate.toString)
+    consumer.set("channels", AudioChannels.toString)
+    consumer.set("movflags", "+faststart") // web-friendly: index at the front so it streams before fully downloaded
+    consumer.connect(built.tractor)
+    consumer.start()
+    new RenderJob(profile, consumer, built)
+
+  /** The length in *timeline* frames a clip at `path` runs to, measured against `spec`'s profile — what
+    * a full-length placement of a freshly imported clip is sized to. Because the measure is against the
+    * timeline's own frame rate (not the source's), a 24 fps clip on a 30 fps timeline reports its length
+    * in 30 fps frames, which is exactly what the model wants: every placement length is in timeline
+    * frames. Creates a producer, so it must run on the main thread (the loader reaches macOS APIs that
+    * throw off it) and after `Mlt.init()`. */
+  def mediaLength(path: String, spec: TimelineSpec): Int =
+    val profile = profileFor(spec)
     val p       = Producer(profile, path)
     val len     = math.max(1, p.length)
     p.close()
@@ -690,7 +761,7 @@ object Player:
     * multitrack pipeline off the GUI, and the seed of a still-export path. */
   def probe(project: Project, frame: Int, out: String): Unit =
     import io.github.edadma.libcairo.{Format, imageSurfaceCreateForData}
-    val profile = Profile(ProfileName)
+    val profile = profileFor(project.spec)
     val built   = buildGraph(profile, project)
     val consumer = Consumer.bare(profile)
     consumer.connect(built.tractor)
@@ -717,7 +788,7 @@ object Player:
     * safe. */
   def probeRebuild(before: Project, after: Project, frame: Int, out: String): Unit =
     import io.github.edadma.libcairo.{Format, imageSurfaceCreateForData}
-    val profile = Profile(ProfileName)
+    val profile = profileFor(before.spec)
 
     val builtA   = buildGraph(profile, before)
     val consumer = Consumer.bare(profile)
@@ -752,7 +823,7 @@ object Player:
     * on a spawned thread, to confirm the swap does nothing that must stay on the main thread. Returns
     * "OK", or the error. A hard crash (NSException) would mean the swap still loads a producer. */
   def probeSwapOffThread(before: Project, after: Project): String =
-    val profile  = Profile(ProfileName)
+    val profile  = profileFor(before.spec)
     val built1   = buildGraph(profile, before)
     val built2   = buildGraph(profile, after)
     val consumer = Consumer.bare(profile)

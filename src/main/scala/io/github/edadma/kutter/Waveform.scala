@@ -30,9 +30,9 @@ final class Waveform(count: Int):
     val i = math.max(0, math.min(count - 1, (fraction * count).toInt))
     if i < made then peaks(i) else 0f
 
-  /** Spawn the background generator: its own graph rendering `path` against `profileName`. */
-  def start(profileName: String, path: String, fps: Double): Unit =
-    val t = new Thread(() => generate(profileName, path, fps), "kutter-waveform")
+  /** Spawn the background generator: its own graph rendering `path` against the timeline `spec`. */
+  def start(spec: TimelineSpec, path: String): Unit =
+    val t = new Thread(() => generate(spec, path), "kutter-waveform")
     t.setDaemon(true)
     thread = t
     t.start()
@@ -43,13 +43,13 @@ final class Waveform(count: Int):
       case t: Thread => t.join()
       case null      => ()
 
-  private def generate(profileName: String, path: String, fps: Double): Unit =
+  private def generate(spec: TimelineSpec, path: String): Unit =
     val cache = cacheFile(path)
     if loadCache(cache) then
       log.debug(s"waveform: loaded $made/$count from cache", category = "player")
       return
 
-    val profile  = Profile(profileName)
+    val profile  = Profile.custom(spec.width, spec.height, spec.fpsNum, spec.fpsDen)
     val producer = Producer(profile, path)
     val consumer = Consumer.bare(profile)
     consumer.connect(producer)
@@ -64,7 +64,7 @@ final class Waveform(count: Int):
             frame.close()
             i = count // end of stream — leave the rest at zero
           else
-            peaks(i) = framePeak(frame, fps)
+            peaks(i) = framePeak(frame, spec.fps, spec.audioRate)
             frame.close()
             made = i + 1
             i += 1
@@ -81,8 +81,8 @@ final class Waveform(count: Int):
 
   /** The largest absolute sample in a frame's audio, across all channels — its peak (clamped 0..1).
     * The samples are interleaved 32-bit floats borrowed from the frame (no copy). */
-  private def framePeak(frame: Frame, fps: Double): Float =
-    val a  = frame.audio(fps, 48000, 2)
+  private def framePeak(frame: Frame, fps: Double, audioRate: Int): Float =
+    val a  = frame.audio(fps, audioRate, 2)
     val n  = a.samples * a.channels
     val fp = a.buffer.asInstanceOf[Ptr[Float]]
     var peak = 0.0f

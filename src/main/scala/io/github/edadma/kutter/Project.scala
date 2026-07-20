@@ -250,15 +250,83 @@ final case class Track(
 object Track:
   given JsonCodec[Track] = DeriveJsonCodec.gen
 
+/** The timeline's own video/audio format — the coordinate system the edit is authored against, not a
+  * property of any one clip. `fps` (a rational, so the broadcast fractional rates are exact) is the
+  * frame clock every timeline position is measured in: a clip's `timelineStart`, `length`, and
+  * `inPoint`, and a lower third's window, are all counts of *these* frames, and MLT resolves each one
+  * to the source frame nearest that instant, so a differently-rated clip is frame-rate-converted, never
+  * indexed past its end. `width`/`height` is the compositing raster clips are scaled (conformed) into
+  * and the lower-third cards are laid out against; `audioRate` is the rate the mix is resampled to.
+  *
+  * It is chosen once — auto-adopted from the first clip placed into a fresh project, or set explicitly
+  * in project settings — and thereafter treated as fixed, because reinterpreting the existing frame
+  * counts at a new `fps` would silently shift every edit in time. `width`/`height` and `audioRate`
+  * are safe to change any time (a rescale and a resample, both non-destructive); only `fps` is load-
+  * bearing once content exists. */
+final case class TimelineSpec(
+    width:     Int = 1280,
+    height:    Int = 720,
+    fpsNum:    Int = 30,
+    fpsDen:    Int = 1,
+    audioRate: Int = 48000,
+):
+  /** The frame rate as a single number — `fpsNum / fpsDen`. */
+  def fps: Double = fpsNum.toDouble / math.max(1, fpsDen)
+
+  /** A short human label for the settings surface, e.g. "1280×720 · 30 fps" or "· 23.98 fps". */
+  def label: String =
+    val r    = fps
+    val rate = if math.abs(r - math.rint(r)) < 1e-6 then r.toInt.toString else f"$r%.2f"
+    s"${width}×${height} · $rate fps"
+
+object TimelineSpec:
+  given JsonCodec[TimelineSpec] = DeriveJsonCodec.gen
+
+  /** The default timeline format — 1280×720 at 30 fps, 48 kHz — what a project takes before any clip
+    * sets it, and what a project saved before timeline specs existed loads as (the field's default
+    * fills in for the missing JSON key). */
+  val default: TimelineSpec = TimelineSpec()
+
+  /** The exact rational for a frame rate, mapping the NTSC fractional rates to their /1001 form and
+    * every other rate to a whole-number-over-one. Used when a rate is picked as a number (the settings
+    * dropdown); auto-adopting a clip reads the source's own num/den directly and needs no guessing. */
+  def fromFps(fps: Double, width: Int = 1280, height: Int = 720, audioRate: Int = 48000): TimelineSpec =
+    val frac = fps - math.floor(fps)
+    val (num, den) =
+      if math.abs(frac - 0.97) < 0.02 || math.abs(frac - 0.976) < 0.02
+      then ((math.round(fps) * 1000).toInt, 1001) // 23.976→24000/1001, 29.97→30000/1001, 59.94→60000/1001
+      else (math.round(fps).toInt, 1)
+    TimelineSpec(width, height, num, den, audioRate)
+
+  /** The frame-rate choices the settings dropdown offers, as (label, num, den) — the common broadcast
+    * and web rates, exact rationals. */
+  val rateChoices: List[(String, Int, Int)] = List(
+    ("23.976", 24000, 1001), ("24", 24, 1), ("25", 25, 1), ("29.97", 30000, 1001),
+    ("30", 30, 1), ("50", 50, 1), ("59.94", 60000, 1001), ("60", 60, 1),
+  )
+
+  /** The resolution choices the settings dropdown offers, as (label, width, height). */
+  val sizeChoices: List[(String, Int, Int)] = List(
+    ("3840×2160 (4K UHD)", 3840, 2160), ("1920×1080 (1080p)", 1920, 1080),
+    ("1280×720 (720p)", 1280, 720), ("854×480 (480p)", 854, 480), ("640×360 (360p)", 640, 360),
+  )
+
+  /** The audio-rate choices the settings dropdown offers, in Hz. */
+  val audioRateChoices: List[Int] = List(48000, 44100)
+
 /** A whole project: the bin of imported source media, the tracks the clips are sequenced on, the lower
-  * thirds over the whole stack, the styles they draw from, and the master output level. */
+  * thirds over the whole stack, the styles they draw from, the timeline format everything is authored
+  * against, and the master output level. */
 final case class Project(
     name:        String,
     bin:         List[MediaClip],
     tracks:      List[Track],
     lowerThirds: List[LowerThird],
     styles:      List[Style],
-    master:      Double = 1.0,
+    master:      Double        = 1.0,
+    spec:        TimelineSpec  = TimelineSpec.default,
+    specLocked:  Boolean       = false, // true once the spec is set explicitly or content exists, so a later import stops auto-adopting
+    created:     String        = "",    // the ISO date (YYYY-MM-DD) the project was started; blank for a project saved before this field existed
 ):
   /** The video tracks, bottom-to-top — the compositing order (each composited over the ones below). */
   def videoTracks: List[Track] = tracks.filter(_.kind == MediaKind.Video)
@@ -271,6 +339,15 @@ final case class Project(
 
   /** Whether any track holds a placed clip — the project has something on the timeline. */
   def hasMedia: Boolean = tracks.exists(_.clips.nonEmpty)
+
+  /** Whether the next imported clip should set the timeline format from its own: only into a fresh
+    * project whose spec has not been pinned (by an explicit settings change or an earlier import) and
+    * that holds no media yet. This is the auto-adopt gate — a first clip defines the timeline, later
+    * clips are conformed to it. */
+  def shouldAdoptSpec: Boolean = !specLocked && bin.isEmpty
+
+  /** Set the timeline format explicitly and pin it, so no later import re-adopts. */
+  def withSpec(s: TimelineSpec): Project = copy(spec = s, specLocked = true)
 
   /** The frame just past the furthest clip on any track, or 0 when the timeline is empty. */
   def contentEnd: Int = tracks.map(_.contentEnd).maxOption.getOrElse(0)
@@ -298,9 +375,15 @@ object Project:
     Track("a1", "A1", MediaKind.Audio),
   )
 
-  /** A fresh, empty project — no bin, the default empty tracks, no overlays, the preset styles. */
+  /** Today's date as an ISO `YYYY-MM-DD` string, the creation date a fresh project is stamped with.
+    * Read at the UTC offset — a fixed offset needs no timezone database, so scala-java-time links
+    * without the tzdb artifact. */
+  def today: String = java.time.LocalDate.now(java.time.ZoneOffset.UTC).toString
+
+  /** A fresh, empty project — no bin, the default empty tracks, no overlays, the preset styles, stamped
+    * with today's date. */
   def blank: Project =
-    Project("Untitled", Nil, defaultTracks, Nil, Style.presets)
+    Project("Untitled", Nil, defaultTracks, Nil, Style.presets, created = today)
 
   /** Read a project from `path`, or a decode error message. */
   def load(path: String): Either[String, Project] =

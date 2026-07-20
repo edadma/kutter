@@ -36,9 +36,9 @@ final class Thumbnails(count: Int, val width: Int, val height: Int):
   /** Whether every thumbnail has been generated. */
   def complete: Boolean = made >= count
 
-  /** Spawn the background generator: its own graph rendering `path` against `profileName`. */
-  def start(profileName: String, path: String): Unit =
-    val t = new Thread(() => generate(profileName, path), "kutter-thumbs")
+  /** Spawn the background generator: its own graph rendering `path` against the timeline `spec`. */
+  def start(spec: TimelineSpec, path: String): Unit =
+    val t = new Thread(() => generate(spec, path), "kutter-thumbs")
     t.setDaemon(true)
     thread = t
     t.start()
@@ -50,7 +50,7 @@ final class Thumbnails(count: Int, val width: Int, val height: Int):
       case t: Thread => t.join()
       case null      => ()
 
-  private def generate(profileName: String, path: String): Unit =
+  private def generate(spec: TimelineSpec, path: String): Unit =
     val dir = cacheDir(path)
     dir.mkdirs()
     def cacheFile(i: Int): File = new File(dir, s"$i.png")
@@ -68,7 +68,7 @@ final class Thumbnails(count: Int, val width: Int, val height: Int):
       log.debug(s"thumbnails: loaded $made/$count from cache", category = "player")
       return
 
-    val profile  = Profile(profileName)
+    val profile  = Profile.custom(spec.width, spec.height, spec.fpsNum, spec.fpsDen)
     val producer = Producer(profile, path)
     val consumer = Consumer.bare(profile)
     consumer.connect(producer)
