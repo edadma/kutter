@@ -441,6 +441,47 @@ final case class Project(
       })
     })
 
+  // Whether `a` and `b` are two contiguous slices of the same source, abutting on the timeline — the
+  // shape a razor cut leaves behind, so removing the seam between them restores one seamless clip. Both
+  // must draw the same source (the same bin clip, or the same title), meet exactly (a ends where b
+  // begins), and play consecutive source frames (b's in-point continues where a's window ended).
+  private def joinable(a: PlacedClip, b: PlacedClip): Boolean =
+    a.timelineEnd == b.timelineStart &&
+      b.inPoint == a.inPoint + a.length &&
+      (if a.titleId.isDefined || b.titleId.isDefined then a.titleId == b.titleId
+       else a.clipId == b.clipId)
+
+  /** The timeline frames where a cut can be removed — a seam between two joinable neighbours on some
+    * track. Used to find the cut nearest the playhead. */
+  def joinBoundaries: List[Int] =
+    tracks.flatMap(t => t.ordered.sliding(2).collect { case Seq(a, b) if joinable(a, b) => a.timelineEnd }).distinct
+
+  /** The removable cut nearest `frame`, within `reach` frames of it, or `None` when the playhead is not
+    * near a seam — how "remove the cut under the cursor" finds its target, forgiving a few frames. */
+  def nearestJoinBoundary(frame: Int, reach: Int): Option[Int] =
+    joinBoundaries.filter(b => math.abs(b - frame) <= reach).minByOption(b => math.abs(b - frame))
+
+  /** The project with the cut at `boundary` removed: on every track, each joinable pair meeting exactly at
+    * `boundary` is merged back into one placement — the left clip extended to cover the right (keeping its
+    * id, start, in-point, link, and any multicam or title role), the right dropped. The inverse of a razor
+    * cut at that frame; a linked pair's two seams (both at `boundary`) rejoin together, so picture and
+    * sound stay locked. A `boundary` with no joinable seam leaves the project unchanged. */
+  def joinAt(boundary: Int): Project =
+    copy(tracks = tracks.map { t =>
+      val ordered = t.ordered
+      val out     = scala.collection.mutable.ListBuffer.empty[PlacedClip]
+      var i       = 0
+      while i < ordered.length do
+        val a = ordered(i)
+        if i + 1 < ordered.length && a.timelineEnd == boundary && joinable(a, ordered(i + 1)) then
+          out += a.copy(length = a.length + ordered(i + 1).length)
+          i   += 2
+        else
+          out += a
+          i   += 1
+      t.copy(clips = out.toList)
+    })
+
   /** Write the project to `path` as pretty JSON. */
   def save(path: String): Unit =
     val w = new PrintWriter(new File(path))

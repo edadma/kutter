@@ -696,6 +696,18 @@ object Player:
     * decode thread would feed the audio device, captured to a file for offline analysis. Runs the graph
     * to its end with a non-realtime avformat consumer (float PCM, 48kHz stereo), so a steady tone in the
     * source comes out as whatever the tractor's mix actually produces. A debug tool, not a playback path. */
+  /** Build `project`'s graph and immediately close it, returning how long the build took in
+    * milliseconds — a perf diagnostic for the cost `update` pays on the UI thread per edit. Requires
+    * `Mlt.init()`. */
+  def buildGraphMillis(project: Project): Long =
+    val profile = profileFor(project.spec)
+    val t0      = System.nanoTime()
+    val built   = buildGraph(profile, project)
+    val ms      = (System.nanoTime() - t0) / 1000000L
+    built.close()
+    profile.close()
+    ms
+
   def renderAudio(project: Project, out: String): Unit =
     val profile  = profileFor(project.spec)
     val built    = buildGraph(profile, project)

@@ -623,6 +623,17 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
   // takes focus (pointer focus climbs to the nearest focusable ancestor), so clicking a clip both selects
   // it and focuses the panel; the key then reaches here. A text field editing an overlay's words keeps its
   // own focus, so Backspace there still edits text rather than deleting a clip.
+  // Remove the cut nearest the playhead: find the joinable seam within the snap magnet's reach of the
+  // playhead (so the cursor need only be near it) and merge its two pieces back into one clip. Nothing
+  // near a seam is a no-op. Clears the selection, since a merged-away piece may have been selected.
+  def removeCutAtPlayhead(): Unit =
+    val reach = Timeline.snapReach(viewFor(math.max(1.0, viewWidth.current)))
+    project.nearestJoinBoundary(playheadRef.current, reach) match
+      case Some(b) =>
+        setSelectedClipId(None)
+        editProject(_.joinAt(b))
+      case None => ()
+
   def onKey(e: KeyEvent): Unit =
     val primary = e.meta || e.ctrl // ⌘ on macOS, Ctrl elsewhere
     if primary && e.scancode == Key.Z then (if e.shift then p.onRedo() else p.onUndo())
@@ -658,9 +669,8 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
         row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
           // The razor: cut every clip at the playhead (also the S key when the timeline has focus).
           KutterUi.textButton(theme)("Cut", () => p.onCut()),
-          // Undo / redo the last edit (also ⌘Z / ⌘⇧Z when the timeline has focus). Dimmed when empty.
-          KutterUi.textButton(theme)("Undo", () => p.onUndo(), enabled = p.canUndo),
-          KutterUi.textButton(theme)("Redo", () => p.onRedo(), enabled = p.canRedo),
+          // Remove the cut nearest the playhead, rejoining the two pieces into one clip (undo of a Cut).
+          KutterUi.textButton(theme)("Join", () => removeCutAtPlayhead()),
           spacer(),
           KutterUi.textButton(theme)("+ A/V", () => p.onAddAvTracks()),
           KutterUi.textButton(theme)("+ Video", () => p.onAddTrack(MediaKind.Video)),

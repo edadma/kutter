@@ -534,6 +534,28 @@ private[kutter] object Diagnostics:
         rv == ra && rv != lk && rv.isDefined
       }, true)
 
+      // Remove-cut (join) is the inverse of the razor: a cut then a join at the same frame restores one
+      // clip; the seam is a joinable boundary; a non-contiguous abutting pair (a trimmed seam, or two
+      // different sources) is not joinable; and the join finds the seam nearest the playhead within reach.
+      val cutThenJoin = splitBase.splitAt(80).joinAt(80)
+      check("join restores one clip", cutThenJoin.tracks.head.clips.map(c => (c.timelineStart, c.length, c.inPoint)), List((0, 200, 30)))
+      check("join boundary listed", splitBase.splitAt(80).joinBoundaries, List(80))
+      check("join nearest within reach", splitBase.splitAt(80).nearestJoinBoundary(83, 8), Some(80))
+      check("join nearest out of reach", splitBase.splitAt(80).nearestJoinBoundary(100, 8), None)
+      check("join no-op off seam", splitBase.splitAt(80).joinAt(120).tracks.head.clips.size, 2)
+      // Two different sources abutting are NOT a joinable cut (removing that seam is meaningless).
+      val other = MediaClip.make("o.mp4", MediaKind.Video, 300)
+      val abut  = Project.blank.copy(bin = List(splitClip, other), tracks = List(io.github.edadma.kutter.Track("v1", "V1", MediaKind.Video, List(
+        PlacedClip.make(splitClip.id, 0, 80), PlacedClip.make(other.id, 80, 80)))))
+      check("different sources not joinable", abut.joinBoundaries, Nil)
+      // A trimmed seam (right in-point no longer continues the left) is not joinable.
+      val trimmedSeam = Project.blank.copy(bin = List(splitClip), tracks = List(io.github.edadma.kutter.Track("v1", "V1", MediaKind.Video, List(
+        PlacedClip.make(splitClip.id, 0, 80, inPoint = 0), PlacedClip.make(splitClip.id, 80, 80, inPoint = 120)))))
+      check("trimmed seam not joinable", trimmedSeam.joinBoundaries, Nil)
+      // A cut linked pair rejoins on both tracks.
+      val rejoined = splitLinked.joinAt(100)
+      check("join linked both tracks", (rejoined.tracks.head.clips.size, rejoined.tracks(1).clips.size), (1, 1))
+
       // Export settings: the container/codec validation and the avformat property mapping. The default is
       // a valid MP4 H.264/AAC; an invalid combination (H.264 in WebM, or AAC in WebM) is caught with a
       // message; switching container keeps a still-legal codec but snaps an illegal one to the container's
@@ -742,6 +764,31 @@ private[kutter] object Diagnostics:
       Mlt.close()
       println(if allOk then "EXPORT PROBE OK" else "EXPORT PROBE FAILED")
       if !allOk then sys.exit(1)
+      return true
+
+    // `KUTTER_PROBE_PERF` times how long `buildGraph` takes on the UI thread per edit — the cost a cut,
+    // move, or trim pays before the preview updates — for a project like the ones edited: a linked A/V
+    // video pair plus a title, then the same after a cut (which doubles the placements/producers).
+    if sys.env.contains("KUTTER_PROBE_PERF") then
+      Mlt.init()
+      val src   = "big_buck_bunny_720p.mp4"
+      val spec  = Player.probeSpec(src)
+      val len   = math.min(300, Player.mediaLength(src, spec))
+      val clip  = MediaClip.make(src, MediaKind.Video, len)
+      val lk    = Some("k")
+      val base  = withTitles(
+        Project.blank.withSpec(spec).copy(bin = List(clip), tracks = List(
+          io.github.edadma.kutter.Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(clip.id, 0, len, link = lk))),
+          io.github.edadma.kutter.Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len, link = lk))),
+        )),
+        List((LowerThird("t", "Lower Third", "a title"), 0, math.max(1, len - 1))))
+      // Warm the card cache and any one-time init, then time a few builds of the base and the post-cut.
+      Player.buildGraphMillis(base)
+      val cut = base.splitAt(len / 2)
+      for i <- 1 to 3 do
+        println(s"buildGraph base (2 producers + 1 card): ${Player.buildGraphMillis(base)} ms")
+        println(s"buildGraph after cut (4 producers + 2 cards): ${Player.buildGraphMillis(cut)} ms")
+      Mlt.close()
       return true
 
     // `KUTTER_PROBE_MULTICAM` renders a switched multicam program off the GUI: a group of three synced
