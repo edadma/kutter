@@ -696,11 +696,11 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       box(flex = 1)(
         scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
           col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min)(
-            // Video tracks on top (highest number first, matching how they composite), audio tracks below
-            // (lowest number first), then the titles lane the lower thirds ride on. Ordered by number so a
-            // freshly created lane lands in its right place regardless of insertion order. Each media lane
-            // is a drop target that knows its own id and kind.
-            ((project.videoTracks.sortBy(_.num.getOrElse(0)).reverse ++ project.audioTracks.sortBy(_.num.getOrElse(Int.MaxValue)))
+            // Lanes grouped by camera: ordered by track number, and within a number the video lane over its
+            // audio lane — so a pair reads together (V1 above A1, then V2 above A2, …) and a freshly added
+            // pair lands at the bottom, next to each other, rather than being split to opposite ends. Then
+            // the titles lane. Each media lane is a drop target that knows its own id and kind.
+            (project.tracks.sortBy(t => (t.num.getOrElse(Int.MaxValue), if t.kind == MediaKind.Video then 0 else 1))
               .map(pt => trackWidget(Timeline.Track(pt.name, blocksFor(pt)), pt))
               :+ trackWidget(Timeline.Track("Titles", overlays = overlayBlocks), null))*,
           ),
