@@ -289,8 +289,31 @@ private val App: Component[Session] = component[Session] { initial =>
 
   val edited     = useRef(false)
   val lastPushed = useRef(initial.project)
+
+  // A structural graph rebuild (`p.update` → `buildGraph`) runs on the UI thread and can cost a few
+  // hundred ms — long enough that doing it inline, before the frame paints, is what makes a cut or a
+  // delete seem to lag on the timeline. So it is *deferred*: the effect posts it to run at the start of
+  // the next UI frame, after this frame has painted the edit, and coalesces a burst of edits into one
+  // rebuild of the latest project (`pendingRebuild` gates re-posting; `latestProject` is the target).
+  val pendingRebuild = useRef(false)
+  val latestProject  = useRef(initial.project)
+
+  def scheduleRebuild(): Unit =
+    if !pendingRebuild.current then
+      pendingRebuild.current = true
+      UiThread.post { () =>
+        pendingRebuild.current = false
+        playerRef.current match
+          case pl: Player =>
+            val t0 = System.nanoTime()
+            pl.update(latestProject.current)
+            LoggerFactory.getLogger.info(s"graph rebuild ${(System.nanoTime() - t0) / 1000000L}ms", category = "player")
+          case null => ()
+      }
+
   useEffect(
     () =>
+      latestProject.current = project
       if edited.current then
         playerRef.current match
           case p: Player =>
@@ -299,7 +322,7 @@ private val App: Component[Session] = component[Session] { initial =>
               if project.master != prev.master then p.setVolume(project.master)
               for t <- project.audioTracks do
                 if !prev.tracks.find(_.id == t.id).exists(_.gain == t.gain) then p.setTrackGain(t.id, t.gain)
-            else p.update(project)
+            else scheduleRebuild() // deferred so the timeline paints this edit before the rebuild runs
           case null => if hasContent(project) then openPlayerFor(project)
         lastPushed.current = project
       else
