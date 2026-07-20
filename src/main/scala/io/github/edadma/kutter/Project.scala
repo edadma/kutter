@@ -359,6 +359,18 @@ final case class Project(
   def updateTrack(id: String)(f: Track => Track): Project =
     copy(tracks = tracks.map(t => if t.id == id then f(t) else t))
 
+  /** The placements that move as a unit with the placement `id`: itself, and — when it is one half of a
+    * linked A/V pair — every placement sharing its link id, across tracks. Each is returned with the id
+    * of the track it sits on, so a move can respect that track's neighbours. An unlinked clip moves alone. */
+  def moveGroupOf(id: String): List[(String, PlacedClip)] =
+    val target = tracks.flatMap(t => t.clips.find(_.id == id).map(c => (t.id, c))).headOption
+    target match
+      case Some((_, pc)) =>
+        pc.link match
+          case Some(lnk) => tracks.flatMap(t => t.clips.filter(_.link.contains(lnk)).map(c => (t.id, c)))
+          case None      => target.toList
+      case None => Nil
+
   /** Write the project to `path` as pretty JSON. */
   def save(path: String): Unit =
     val w = new PrintWriter(new File(path))
