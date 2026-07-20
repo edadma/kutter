@@ -75,9 +75,15 @@ private val BinPanel: Component[BinProps] = component[BinProps] { p =>
       ),
     )
 
+  // A section's empty-state hint — a natural-height line, so an empty section takes only a row of space
+  // (not a growing fill) and the sections below it stay put.
+  def emptyHint(hint: String): VNode =
+    box(padding = EdgeInsets.symmetric(horizontal = 0, vertical = 10))(text(hint, size = 13, color = theme.border))
+
   KutterUi.titledPanel(theme)("Bin")(
     col(crossAxisAlignment = CrossAxisAlignment.Stretch, spacing = 10)(
-      // Project actions: start over, open/save a `.kutter`, project settings, export a video.
+      // Project actions: a fixed toolbar at the top — start over, open/save a `.kutter`, project
+      // settings, export a video. It stays put while the bin's contents scroll below it.
       row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
         button("New", p.onNew),
         button("Open", p.onOpen),
@@ -86,42 +92,40 @@ private val BinPanel: Component[BinProps] = component[BinProps] { p =>
         spacer(),
         button("Export", p.onExport),
       ),
-      // Media section: the imported clips (video and audio), each removable, with import actions. Its
-      // list takes a flex share of the column so a long bin scrolls within its own half rather than
-      // pushing the Titles section off the bottom — both sections stay visible whether or not either holds
-      // anything.
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-        text("Media", size = 11, weight = FontWeight.Bold, color = theme.border),
-        spacer(),
-        button("+ Video", p.onImportVideo),
-        button("+ Audio", p.onImportAudio),
-      ),
+      // The bin's contents — the Media and Titles sections stacked — scroll as ONE region, each section at
+      // its natural height. So an empty section takes only its header plus a hint (no reserved half), and a
+      // long bin scrolls the whole column rather than each list scrolling inside its own cramped box.
       box(flex = 1)(
-        if p.bin.isEmpty then KutterUi.placeholder(theme)("No media imported")
-        else
-          scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
-            col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 4)(
-              p.bin.map(binClipRow)*,
+        scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
+          col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 10)(
+            // Media section: the imported clips (video and audio), each removable, with import actions.
+            row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
+              text("Media", size = 11, weight = FontWeight.Bold, color = theme.border),
+              spacer(),
+              button("+ Video", p.onImportVideo),
+              button("+ Audio", p.onImportAudio),
             ),
-          ),
-      ),
-      // Titles section: import a `.klt` list or add one by hand — both work with or without footage, so a
-      // titles-only project (design ahead of a shoot, or a titles-only render) needs no video at all.
-      // Drag a title onto a video track to place it; re-importing a `.klt` updates its titles in place.
-      row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-        text("Titles", size = 11, weight = FontWeight.Bold, color = theme.border),
-        spacer(),
-        button("Import…", p.onImportLts),
-        button("+ Add", p.onAddLt),
-      ),
-      box(flex = 1)(
-        if p.lowerThirds.isEmpty then KutterUi.placeholder(theme)("No titles yet")
-        else
-          scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
-            col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 3)(
-              p.lowerThirds.map(ltRow)*,
+            if p.bin.isEmpty then emptyHint("No media imported")
+            else
+              col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 4)(
+                p.bin.map(binClipRow)*,
+              ),
+            // Titles section: import a `.klt` list or add one by hand — both work with or without footage,
+            // so a titles-only project (design ahead of a shoot, or a titles-only render) needs no video at
+            // all. Drag a title onto a video track to place it; re-importing a `.klt` updates it in place.
+            row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
+              text("Titles", size = 11, weight = FontWeight.Bold, color = theme.border),
+              spacer(),
+              button("Import…", p.onImportLts),
+              button("+ Add", p.onAddLt),
             ),
+            if p.lowerThirds.isEmpty then emptyHint("No titles yet")
+            else
+              col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 3)(
+                p.lowerThirds.map(ltRow)*,
+              ),
           ),
+        ),
       ),
     ),
   )
