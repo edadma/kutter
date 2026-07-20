@@ -206,13 +206,14 @@ object Timeline:
 
   /** Paint the ruler widget: a faint band with a tick and a centred m:ss label at a spacing that
     * stays uncrowded at the view's scale, covering only the seconds the view shows, plus the
-    * playhead's grip and top line. */
-  def paintRuler(cv: Canvas, size: Size, view: View, position: Int, theme: Theme): Unit =
+    * playhead's grip and top line. Frames are converted to seconds at `fps` — the timeline's own
+    * frame rate — so a differently-rated project labels time correctly (a 24 fps clip ends at its
+    * real second, not compressed by a fixed 30). */
+  def paintRuler(cv: Canvas, size: Size, view: View, position: Int, fps: Double, theme: Theme): Unit =
     val w       = size.width
     val rulerBg = if theme.isDark then Color.rgb(0x22262a) else Color.rgb(0xd0d4d8)
     cv.fillRect(Rect(0, 0, w, size.height), rulerBg)
 
-    val fps       = 30.0
     val minTickPx = 56.0
     val pxPerSec  = fps * view.pxPerFrame
     val step      = math.max(1, math.ceil(minTickPx / math.max(1e-9, pxPerSec)).toInt)

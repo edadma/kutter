@@ -636,9 +636,11 @@ private val App: Component[Session] = component[Session] { initial =>
           Repaint.request()
           e.consume()
 
-  // The active monitor's length: the timeline's in the project monitor, the previewed clip's in the
-  // clip monitor. The transport derives its own played fraction from this and the position it polls.
-  val activeTotal = if isClip then clipTotal else total
+  // The active monitor's length: the *content* reach in the project monitor (what actually plays —
+  // the graph ends at the last clip/lower third, not in the empty runway the timeline pads on for
+  // dragging), the previewed clip's in the clip monitor. The transport derives its played fraction and
+  // its total-time readout from this, so a 20-second project reads 0:20, not the padded timeline length.
+  val activeTotal = if isClip then clipTotal else contentReach
 
   // Seek the active monitor to `fraction` of its length and render that frame. In the project monitor
   // the timeline playhead follows at once (set the ref and repaint); the transport's own readout tracks
@@ -1654,7 +1656,7 @@ private val App: Component[Session] = component[Session] { initial =>
             ),
           ),
         ),
-        box(flex = 1)(scrubCanvas((cv, size) => Timeline.paintRuler(cv, size, viewFor(size.width), playheadRef.current, theme))),
+        box(flex = 1)(scrubCanvas((cv, size) => Timeline.paintRuler(cv, size, viewFor(size.width), playheadRef.current, fps, theme))),
       ),
     )
 
