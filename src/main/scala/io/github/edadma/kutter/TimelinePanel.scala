@@ -35,6 +35,7 @@ private final case class TimelineProps(
     onDropClip:          (String, String, Int) => Unit,
     onRemovePlacement:   String => Unit,
     onRemoveLowerThird:  String => Unit,
+    onAddTrack:          MediaKind => Unit,
 )
 
 private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] { p =>
@@ -694,11 +695,22 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       box(flex = 1)(
         scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
           col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min)(
-            // One lane per project track (each a drop target, knowing its own id/kind), then the titles
-            // lane the lower thirds ride on.
-            (project.tracks.map(pt => trackWidget(Timeline.Track(pt.name, blocksFor(pt)), pt))
+            // Video tracks on top (highest-numbered first, matching how they composite), audio tracks
+            // below, then the titles lane the lower thirds ride on. Each media lane is a drop target that
+            // knows its own id and kind.
+            ((project.videoTracks.reverse ++ project.audioTracks).map(pt => trackWidget(Timeline.Track(pt.name, blocksFor(pt)), pt))
               :+ trackWidget(Timeline.Track("Titles", overlays = overlayBlocks), null))*,
           ),
+        ),
+      ),
+      // Add another track — a second camera on its own video lane, or another audio track. A new video
+      // track stacks atop the video group (it composites over the others); a new audio track goes below.
+      box(bg = theme.background, padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
+        row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
+          text("Add track", size = 11, weight = FontWeight.Bold, color = theme.border),
+          spacer(),
+          KutterUi.textButton(theme)("+ Video", () => p.onAddTrack(MediaKind.Video)),
+          KutterUi.textButton(theme)("+ Audio", () => p.onAddTrack(MediaKind.Audio)),
         ),
       ),
     ),

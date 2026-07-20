@@ -943,6 +943,20 @@ private val App: Component[Session] = component[Session] { initial =>
         reopen(np, path)
     }
 
+  // Add an empty video or audio track. A new video track joins the top of the video group (so it
+  // composites over the others and draws highest); a new audio track joins the end of the audio group.
+  // Numbered by how many of its kind already exist. An empty track adds no generators, so it rides the
+  // live graph-swap like any structural-but-media-unchanged edit.
+  def addTrack(kind: MediaKind): Unit =
+    val n  = project.tracks.count(_.kind == kind) + 1
+    val nt = Track(s"trk-${System.nanoTime()}", s"${if kind == MediaKind.Video then "V" else "A"}$n", kind)
+    val tracks = kind match
+      case MediaKind.Video =>
+        val (vids, auds) = project.tracks.partition(_.kind == MediaKind.Video)
+        (vids :+ nt) ++ auds
+      case MediaKind.Audio => project.tracks :+ nt
+    editProject(_.copy(tracks = tracks))
+
   val timelinePanel = TimelinePanel(TimelineProps(
     project             = project,
     total               = total,
@@ -961,6 +975,7 @@ private val App: Component[Session] = component[Session] { initial =>
     onDropClip          = onDropClip(_, _, _),
     onRemovePlacement   = removePlacement,
     onRemoveLowerThird  = removeLowerThird,
+    onAddTrack          = addTrack,
   ))
 
   // The editor body, Resolve-style: a top row of bin | player | inspector — split by draggable
