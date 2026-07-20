@@ -452,6 +452,24 @@ private[kutter] object Diagnostics:
       check("mc activeAngleAt off", Multicam.activeAngleAt(bproj, bg.id, 500), -1)
       check("mc addTitle appends", Multicam.addTitle(bproj, bg.id, Multicam.titleAngle("T", "N", "S")).multicams.head.angles.size, 3)
 
+      // Timeline.dropClip: a bin clip dragged onto a track. A video clip on a video track lands as a
+      // linked A/V pair (picture on the video track, sound on the first audio track, same window); an
+      // audio clip lands on the audio track; an incompatible pairing (audio onto a video track) is a
+      // no-op that returns the very same project.
+      val dcVid    = MediaClip.make("v.mp4", MediaKind.Video, 200)
+      val dcAud    = MediaClip.make("a.mp3", MediaKind.Audio, 200)
+      val dcBase   = Project.blank.copy(bin = List(dcVid, dcAud))
+      val droppedV = Timeline.dropClip(dcBase, dcVid.id, "v1", 30, 200)
+      check("dropClip video on v1", droppedV.tracks.find(_.id == "v1").get.clips.map(c => (c.timelineStart, c.length)), List((30, 200)))
+      check("dropClip pairs audio", droppedV.tracks.find(_.id == "a1").get.clips.map(c => (c.timelineStart, c.length)), List((30, 200)))
+      check("dropClip pair linked", {
+        val v = droppedV.tracks.find(_.id == "v1").get.clips.head
+        val a = droppedV.tracks.find(_.id == "a1").get.clips.head
+        v.link.isDefined && v.link == a.link
+      }, true)
+      check("dropClip audio on a1", Timeline.dropClip(dcBase, dcAud.id, "a1", 50, 200).tracks.find(_.id == "a1").get.clips.map(c => (c.timelineStart, c.length)), List((50, 200)))
+      check("dropClip mismatch noop", Timeline.dropClip(dcBase, dcAud.id, "v1", 0, 200) eq dcBase, true)
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true

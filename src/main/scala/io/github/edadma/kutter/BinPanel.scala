@@ -54,13 +54,15 @@ private val BinPanel: Component[BinProps] = component[BinProps] { p =>
     )
 
   // One bin row: a kind icon, the file name (click to preview it in the clip monitor — the selected
-  // row fills primary), a Place button that drops it on the timeline, and a remove button (which
-  // confirms, since removing a source takes its placements with it).
+  // row fills primary; drag it onto a timeline track to place it there), a Place button that drops it at
+  // the playhead, and a remove button (which confirms, since removing a source takes its placements with
+  // it). The name is the drag source: its payload is the clip id, which the timeline lanes accept as a drop.
   def binClipRow(clip: MediaClip): VNode =
     val selected = p.selectedBinId.contains(clip.id)
     row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 8)(
       svg(if clip.kind == MediaKind.Audio then volumeIcon else playIcon, width = 16, height = 16),
       box(onClick = _ => p.onPreviewClip(clip), cursor = Cursor.Pointer, flex = 1, radius = 6,
+        dragPayload = clip.id,
         bg = if selected then theme.primary else Color.transparent,
         padding = EdgeInsets.symmetric(horizontal = 6, vertical = 4))(
         text(clip.name, size = 13, color = if selected then theme.onPrimary else theme.surfaceText, maxLines = 1),

@@ -930,6 +930,19 @@ private val App: Component[Session] = component[Session] { initial =>
   // the live project and the timeline metrics it computes (length, fit span, frame rate), the current
   // selection, and the two shared refs it advances and reads — the playhead and the project player;
   // every edit funnels back through the callbacks. `resetToken` refits it to the whole timeline.
+  // Place a bin clip dragged onto a track at `frame`. The pure `Timeline.dropClip` resolves it — a video
+  // clip becomes a linked A/V pair (picture on the target video track, sound on the first audio track), an
+  // audio clip lands on the audio track, an incompatible pairing is a no-op (the same project reference
+  // back). Placing changes the lanes' generators, so a real change re-opens the player, as importing does.
+  def onDropClip(clipId: String, trackId: String, frame: Int): Unit =
+    project.clipFor(clipId).foreach { clip =>
+      val srcLen = math.max(1, if clip.frames > 0 then clip.frames else Player.mediaLength(clip.path, project.spec))
+      val np     = Timeline.dropClip(project, clipId, trackId, frame, srcLen)
+      if np ne project then
+        dirty.current = true
+        reopen(np, path)
+    }
+
   val timelinePanel = TimelinePanel(TimelineProps(
     project             = project,
     total               = total,
@@ -945,6 +958,7 @@ private val App: Component[Session] = component[Session] { initial =>
     setSelectedClipId   = setSelectedClipId,
     setSelectedLtId     = setSelectedId,
     focusProjectMonitor = () => focusProjectMonitor(),
+    onDropClip          = onDropClip(_, _, _),
   ))
 
   // The editor body, Resolve-style: a top row of bin | player | inspector — split by draggable

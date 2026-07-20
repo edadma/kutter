@@ -210,6 +210,42 @@ object Timeline:
     val room   = math.min(nextA, nextB) - start
     (start, math.min(srcLen, room))
 
+  /** The project after dropping the bin clip `clipId` onto the track `trackId` at timeline frame `frame`,
+    * `srcLen` frames of source available. This is what a drag from the bin resolves to. A **video** clip
+    * dropped on a **video** track lands as a linked A/V pair — its picture on that track and its sound on
+    * the first audio track, at one start both can hold (so they read and move as one); with no audio track
+    * it is the picture alone. An **audio** clip on an **audio** track lands there. A mismatch (an audio clip
+    * on a video track, say) or a drop with no room returns the project unchanged (the same reference), so a
+    * caller can tell nothing happened. The landing point and length come from [[freePlacement]], so a drop
+    * into a gap fills it and a drop onto a clip snaps past it — the same math the drop-preview ghost uses. */
+  def dropClip(project: Project, clipId: String, trackId: String, frame: Int, srcLen: Int): Project =
+    (project.clipFor(clipId), project.tracks.find(_.id == trackId)) match
+      case (Some(clip), Some(pt)) =>
+        // `pt`/`at` are project tracks (inferred, so the nested `Timeline.Track` name doesn't shadow the
+        // project `Track` here); this reads a track's placements as the (start, length) pairs freePlacement
+        // wants, and lands one placement on a single track.
+        def blocksOf(clips: List[PlacedClip]): Seq[(Int, Int)] = clips.map(c => (c.timelineStart, c.length))
+        def onOne(track: Project => (String, List[PlacedClip])): Project =
+          val (tid, clips)    = track(project)
+          val (start, length) = freePlacement(frame, srcLen, blocksOf(clips), Nil)
+          if length <= 0 then project
+          else project.updateTrack(tid)(x => x.copy(clips = x.clips :+ PlacedClip.make(clipId, start, length)))
+        (clip.kind, pt.kind) match
+          case (MediaKind.Video, MediaKind.Video) =>
+            project.audioTracks.headOption match
+              case Some(at) =>
+                val (start, length) = freePlacement(frame, srcLen, blocksOf(pt.clips), blocksOf(at.clips))
+                if length <= 0 then project
+                else
+                  val link = Some(s"lnk-${System.nanoTime()}")
+                  project.copy(tracks = project.tracks.map(t =>
+                    if t.id == pt.id || t.id == at.id then t.copy(clips = t.clips :+ PlacedClip.make(clipId, start, length, link = link))
+                    else t))
+              case None => onOne(_ => (pt.id, pt.clips))
+          case (MediaKind.Audio, MediaKind.Audio) => onOne(_ => (pt.id, pt.clips))
+          case _                                  => project // an incompatible clip/track pairing: no drop
+      case _ => project
+
   private def playheadInk(theme: Theme): Color = theme.accent
 
   /** A readable ink for a caption over `bg`: black on a light block, white on a dark one. */

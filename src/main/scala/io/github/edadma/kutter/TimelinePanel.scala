@@ -32,6 +32,7 @@ private final case class TimelineProps(
     setSelectedClipId:   Option[String] => Unit,
     setSelectedLtId:     Option[String] => Unit,
     focusProjectMonitor: () => Unit,
+    onDropClip:          (String, String, Int) => Unit,
 )
 
 private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] { p =>
@@ -115,6 +116,12 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
   val panning      = useRef(false)
   val panGrabX     = useRef(0.0)
   val panOrigStart = useRef(0.0)
+
+  // The drop preview while a bin clip is dragged over a lane: the target track id and the (start, length)
+  // the clip would land at, or null when nothing is being dragged over a lane. The lane paints a
+  // translucent ghost from it, so the drop lands exactly where the ghost showed. A ref — updated on every
+  // drag-over and cleared on leave/drop, driving a repaint, never a re-render.
+  val dropPreview = useRef[(String, Int, Int) | Null](null)
 
   // Refit the viewport whenever App bumps the reset token (a new or newly opened project, or a settings
   // change): pan home and drop the zoom so the next paint fits the whole timeline to the window rather
@@ -486,12 +493,48 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       }
     }
 
-  // The tracks, drawn top-to-bottom: one lane per project track (a video track's filmstrips, an audio
-  // track's waveforms), then the titles lane the lower thirds ride on. The empty default tracks (V1, A1)
-  // still show as lanes waiting for clips, as in any editor. The titles lane is always present so it is a
-  // stable target as overlays are added.
-  val mediaTracks = project.tracks.map(t => Timeline.Track(t.name, blocksFor(t)))
-  val tracks      = mediaTracks :+ Timeline.Track("Titles", overlays = overlayBlocks)
+  // While a bin clip is dragged over a media lane, resolve where it would land on that track and remember
+  // it so the lane can paint a ghost — the same `freePlacement` math the drop itself uses, so the preview
+  // and the result agree. A clip whose kind does not match the track (an audio clip over a video lane)
+  // shows no ghost and will not drop.
+  def dragOverLane(pt: Track, e: DragEvent): Unit =
+    val landing: (String, Int, Int) | Null =
+      (e.payload match { case s: String => project.clipFor(s); case _ => None }) match
+        case Some(clip) if clip.kind == pt.kind =>
+          val srcLen          = math.max(1, clip.frames)
+          val f               = Timeline.frameAt(e.localX, total, viewFor(e.size.width))
+          val (start, length) = Timeline.freePlacement(f, srcLen, pt.clips.map(c => (c.timelineStart, c.length)), Nil)
+          if length > 0 then (pt.id, start, length) else null
+        case _ => null
+    dropPreview.current = landing
+    Repaint.request()
+
+  // A bin clip dropped on a media lane: hand the payload, the track, and the frame back to App to place
+  // (App resolves a video clip into a linked A/V pair). Clear the ghost either way.
+  def dropOnLane(pt: Track, e: DragEvent): Unit =
+    e.payload match
+      case s: String => p.onDropClip(s, pt.id, Timeline.frameAt(e.localX, total, viewFor(e.size.width)))
+      case _         => ()
+    dropPreview.current = null
+    Repaint.request()
+
+  def clearDropPreview(): Unit =
+    dropPreview.current = null
+    Repaint.request()
+
+  // Paint the drop-preview ghost on track `trackId`'s lane, if a clip is being dragged over it: a
+  // translucent accent block outlined in the accent across the frames the drop would occupy.
+  def paintDropGhost(cv: Canvas, size: Size, trackId: String): Unit =
+    dropPreview.current match
+      case (tid, start, length) =>
+        if tid == trackId && length > 0 then
+          val view = viewFor(size.width)
+          val x0   = view.xOf(start.toDouble)
+          val w    = math.max(1.0, view.xOf((start + length).toDouble) - x0)
+          val rect = Rect(x0, 2, w, size.height - 4)
+          cv.fillRect(rect, theme.accent.withAlpha(70))
+          cv.strokeRect(rect, theme.accent, 1.5)
+      case null => ()
 
   // Scrubbing works from the ruler or any track: a left press begins, drag seeks (the canvas
   // captures the pointer so it tracks past the widget's edges), release ends. A middle press
@@ -550,8 +593,14 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
   // its segment of the playhead. On the titles lane a press on a block selects that lower third and
   // begins a drag that slides its window (the inspector's In/Out follow live); a press on the empty
   // part of any lane scrubs.
-  def trackWidget(t: Timeline.Track): VNode =
-    val paint = (cv: Canvas, size: Size) => Timeline.paintTrack(cv, size, t, viewFor(size.width), playheadRef.current, theme)
+  def trackWidget(t: Timeline.Track, projectTrack: Track | Null): VNode =
+    val paint = projectTrack match
+      case pt: Track =>
+        (cv: Canvas, size: Size) =>
+          Timeline.paintTrack(cv, size, t, viewFor(size.width), playheadRef.current, theme)
+          paintDropGhost(cv, size, pt.id)
+      case null =>
+        (cv: Canvas, size: Size) => Timeline.paintTrack(cv, size, t, viewFor(size.width), playheadRef.current, theme)
     val lane =
       t.overlays match
         case null =>
@@ -609,10 +658,16 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
               endScrub(),
             onWheel = wheelPan,
           )(paint)
+    // A media lane is a drop target for a bin clip dragged onto it (the ghost shows where it will land);
+    // the titles lane takes no clip drops.
+    val laneBox = projectTrack match
+      case pt: Track =>
+        box(flex = 1, onDragOver = e => dragOverLane(pt, e), onDragLeave = () => clearDropPreview(), onDrop = e => dropOnLane(pt, e))(lane)
+      case null => box(flex = 1)(lane)
     box(height = Timeline.TrackHeight)(
       row(crossAxisAlignment = CrossAxisAlignment.Stretch)(
         trackLabel(t.name),
-        box(flex = 1)(lane),
+        laneBox,
       ),
     )
 
@@ -625,7 +680,10 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       box(flex = 1)(
         scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
           col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min)(
-            tracks.map(trackWidget)*,
+            // One lane per project track (each a drop target, knowing its own id/kind), then the titles
+            // lane the lower thirds ride on.
+            (project.tracks.map(pt => trackWidget(Timeline.Track(pt.name, blocksFor(pt)), pt))
+              :+ trackWidget(Timeline.Track("Titles", overlays = overlayBlocks), null))*,
           ),
         ),
       ),
