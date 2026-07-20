@@ -207,7 +207,14 @@ object MediaClip:
   *
   * `link` groups the two halves of a video-with-sound clip: the picture on a video track and its audio
   * on an audio track share a link id, so they read as one clip (the audio's peaks sit under the picture
-  * for clapper/audio sync) and move together. Two independent clips have no link. */
+  * for clapper/audio sync) and move together. Two independent clips have no link.
+  *
+  * `mc`/`angle` mark a placement as one *cut* of a multicam program: `mc` names the [[Multicam]] group
+  * it belongs to and `angle` which of that group's synced angles it currently shows. A run of abutting
+  * cuts on one video track is the switched program picture; the group's audio bed plays continuously from
+  * a separate audio placement. When `angle` resolves to a title angle, the cut draws that angle's card
+  * full-frame — a title cut is a video clip like any other (see `Player.buildGraph`), and `clipId` is
+  * unused. An ordinary placement has `mc = None`. */
 final case class PlacedClip(
     id:            String,
     clipId:        String,
@@ -215,6 +222,8 @@ final case class PlacedClip(
     inPoint:       Int,
     length:        Int,
     link:          Option[String] = None,
+    mc:            Option[String] = None,
+    angle:         Int            = 0,
 ):
   /** The frame just past this placement's end on the timeline. */
   def timelineEnd: Int = timelineStart + length
@@ -323,10 +332,11 @@ final case class Project(
     tracks:      List[Track],
     lowerThirds: List[LowerThird],
     styles:      List[Style],
-    master:      Double        = 1.0,
-    spec:        TimelineSpec  = TimelineSpec.default,
-    specLocked:  Boolean       = false, // true once the spec is set explicitly or content exists, so a later import stops auto-adopting
-    created:     String        = "",    // the ISO date (YYYY-MM-DD) the project was started; blank for a project saved before this field existed
+    master:      Double         = 1.0,
+    spec:        TimelineSpec   = TimelineSpec.default,
+    specLocked:  Boolean        = false, // true once the spec is set explicitly or content exists, so a later import stops auto-adopting
+    created:     String         = "",    // the ISO date (YYYY-MM-DD) the project was started; blank for a project saved before this field existed
+    multicams:   List[Multicam] = Nil,   // the multicam groups whose synced angles the program cuts draw from
 ):
   /** The video tracks, bottom-to-top — the compositing order (each composited over the ones below). */
   def videoTracks: List[Track] = tracks.filter(_.kind == MediaKind.Video)
@@ -354,6 +364,9 @@ final case class Project(
 
   /** The style with `id`, or the first style as a fallback so a dangling reference still renders. */
   def styleFor(id: String): Style = styles.find(_.id == id).getOrElse(styles.head)
+
+  /** The multicam group with `id`, if it is still in the project. */
+  def mcFor(id: String): Option[Multicam] = multicams.find(_.id == id)
 
   /** Replace the track with `id` through `f`, leaving the rest untouched. */
   def updateTrack(id: String)(f: Track => Track): Project =

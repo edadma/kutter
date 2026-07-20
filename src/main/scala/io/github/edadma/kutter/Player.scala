@@ -566,16 +566,36 @@ object Player:
       val pl     = Playlist(profile)
       var cursor = 0
       for pc <- track.ordered do
-        project.clipFor(pc.clipId).foreach { clip =>
-          if pc.timelineStart > cursor then pl.blank(pc.timelineStart - cursor)
-          val prod = Producer(profile, clip.path)
-          if track.kind == MediaKind.Audio then prod.setInt("video_index", -1)
-          else prod.setInt("audio_index", -1)
-          prod.setInAndOut(pc.inPoint, pc.inPoint + pc.length - 1)
-          pl.append(prod)
-          clipProds += prod
-          cursor = pc.timelineEnd
-        }
+        // A multicam title cut draws its angle's card full-frame — a title cut is treated as a video clip
+        // — so it is resolved from the group here; every other placement (an ordinary clip, or a multicam
+        // clip-angle cut, whose source id and in-point are already on the placement) is its bin source.
+        val titleAngle =
+          pc.mc.flatMap(project.mcFor).flatMap(_.angleAt(pc.angle)).map(_.source).collect {
+            case t: AngleSource.Title => t
+          }
+        val prod: Producer | Null = titleAngle match
+          case Some(t) =>
+            val lt   = LowerThird(s"mc-${pc.id}", t.name, t.title, 0, math.max(1, pc.length - 1),
+              styleId = t.styleId, body = t.body)
+            val card = Producer(profile, CardRenderer.renderCard(lt, project.styleFor(t.styleId), profile.width, profile.height))
+            cardProds += card
+            card
+          case None =>
+            project.clipFor(pc.clipId) match
+              case Some(clip) =>
+                val p = Producer(profile, clip.path)
+                clipProds += p
+                p
+              case None => null
+        prod match
+          case p: Producer =>
+            if pc.timelineStart > cursor then pl.blank(pc.timelineStart - cursor)
+            if track.kind == MediaKind.Audio then p.setInt("video_index", -1)
+            else p.setInt("audio_index", -1)
+            p.setInAndOut(pc.inPoint, pc.inPoint + pc.length - 1)
+            pl.append(p)
+            cursor = pc.timelineEnd
+          case null => ()
       // Every audio track carries a `volume` filter so the mixer has a live handle to ride its gain
       // without rebuilding the graph (see `setTrackGain`); video tracks are silent, so none.
       //

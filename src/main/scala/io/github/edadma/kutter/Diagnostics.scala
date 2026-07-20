@@ -357,6 +357,55 @@ private[kutter] object Diagnostics:
       val merged     = existing.filterNot(_.source.contains("f.klt")) ++ reimported
       check("reimport replaces source", merged.map(_.id), List("b", "c", "a2"))
 
+      // Multicam: switching one program picture between synced angles while the audio bed plays through.
+      // A group of three angles — two cameras (Cam B offset by 100 source frames) and a title slide —
+      // over a 180-frame program starting at 0. The whole editing model is these pure operations:
+      // `inPointFor` (which source frame an angle plays at a program position), `initialProgram` (one cut
+      // of the opening angle), `switchAt` (split the cut and re-cut the right part to the new angle, merging
+      // same-angle neighbours), and `audioBed` (the continuous sound from the chosen angle).
+      val camA  = Multicam.clipAngle("Cam A", "clipA")
+      val camB  = Multicam.clipAngle("Cam B", "clipB", offset = 100)
+      val slide = Multicam.titleAngle("Title", "Hello", "World")
+      val group = Multicam.make("Show", List(camA, camB, slide), audioAngle = 0)
+
+      // A synced clip angle reads a later source frame as the program advances; Cam B's offset shifts it;
+      // a title angle has no source frame.
+      check("mc inPoint synced", Multicam.inPointFor(camA, 0, 60), 60)
+      check("mc inPoint offset", Multicam.inPointFor(camB, 0, 60), 160)
+      check("mc inPoint title", Multicam.inPointFor(slide, 0, 60), 0)
+
+      // The opening program is one cut of the first angle spanning the whole placement.
+      val prog0 = Multicam.initialProgram(group, 0, 180, 0)
+      check("mc initial cut", prog0.map(c => (c.timelineStart, c.length, c.angle)), List((0, 180, 0)))
+      check("mc initial source", prog0.head.clipId, "clipA")
+
+      // Switching to Cam B at 60 splits the segment; the right part is re-cut to Cam B with a synced
+      // in-point (offset 100 + 60 into the program). Switching to the title at 120 cuts again; a title
+      // cut carries no source id (its card is resolved from the group when the graph is built).
+      val prog1 = Multicam.switchAt(prog0, group, 0, 60, 1)
+      check("mc switch cuts", prog1.map(c => (c.timelineStart, c.length, c.angle)), List((0, 60, 0), (60, 120, 1)))
+      check("mc switch inPoint", prog1(1).inPoint, 160)
+      check("mc switch source", prog1(1).clipId, "clipB")
+      val prog2 = Multicam.switchAt(prog1, group, 0, 120, 2)
+      check("mc switch to title", prog2.map(c => (c.timelineStart, c.length, c.angle)), List((0, 60, 0), (60, 60, 1), (120, 60, 2)))
+      check("mc title cut no source", prog2(2).clipId, "")
+
+      // Switching to the angle already showing, or at a frame off the program, changes nothing.
+      check("mc switch noop same", Multicam.switchAt(prog2, group, 0, 30, 0).map(_.angle), List(0, 1, 2))
+      check("mc switch off program", Multicam.switchAt(prog0, group, 0, 500, 1).map(_.angle), List(0))
+
+      // Switching a segment back to a neighbour's angle merges them into one continuous cut.
+      check("mc switch merges", Multicam.switchAt(prog2, group, 0, 120, 1).map(c => (c.timelineStart, c.length, c.angle)), List((0, 60, 0), (60, 120, 1)))
+
+      // The audio bed is the audio angle's source, continuous across the program; a title audio angle has
+      // no sound, so there is no bed.
+      val bed = Multicam.audioBed(group, 0, 180)
+      check("mc audio bed", bed.map(b => (b.clipId, b.timelineStart, b.length, b.angle)), Some(("clipA", 0, 180, 0)))
+      check("mc audio bed title none", Multicam.audioBed(group.copy(audioAngle = 2), 0, 180), None)
+
+      // The group survives the JSON round-trip the project is saved through, angle sum type and all.
+      check("mc json roundtrip", group.toJson.fromJson[Multicam], Right(group))
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true
@@ -479,6 +528,47 @@ private[kutter] object Diagnostics:
       println(s"  finished=$done  exists=${f.exists()}  bytes=$size")
       if !done || !f.exists() || size < 1024 then { println("EXPORT PROBE FAILED"); sys.exit(1) }
       println("EXPORT PROBE OK")
+      return true
+
+    // `KUTTER_PROBE_MULTICAM` renders a switched multicam program off the GUI: a group of three synced
+    // angles — two camera clips and a full-frame title slide — laid out as a program on V1 (Cam A for the
+    // first 60 frames, Cam B for the next 60, the title slide for the last 60) with Cam A's audio as the
+    // continuous bed on A1. It writes one PNG per cut so each angle can be eyeballed (the title cut shows
+    // as a card composited over the base, treated as a video clip) and renders the audio bed to a WAV to
+    // confirm the sound is one continuous source across the picture cuts. This is the whole Stage-1 model:
+    // the pure switch math lives in `KUTTER_PROBE_HIT`; this proves it compiles and renders.
+    if sys.env.contains("KUTTER_PROBE_MULTICAM") then
+      Mlt.init()
+      val camAClip = MediaClip.make("big_buck_bunny_720p.mp4", MediaKind.Video, 600)
+      val camBClip = MediaClip.make("examples/sample-silent.mp4", MediaKind.Video, 600)
+      val angA     = Multicam.clipAngle("Cam A", camAClip.id)
+      val angB     = Multicam.clipAngle("Cam B", camBClip.id)
+      val angT     = Multicam.titleAngle("Title", "Multicam", "a title slide, cut like a camera", styleId = "broadcast-blue")
+      val group    = Multicam.make("Show", List(angA, angB, angT), audioAngle = 0)
+
+      val progStart = 0
+      val length    = 180
+      var cuts = Multicam.initialProgram(group, progStart, length, 0) // all Cam A
+      cuts = Multicam.switchAt(cuts, group, progStart, 60, 1)         // cut to Cam B at frame 60
+      cuts = Multicam.switchAt(cuts, group, progStart, 120, 2)        // cut to the title at frame 120
+      val bed = Multicam.audioBed(group, progStart, length).toList
+
+      val proj = Project.blank.copy(
+        bin       = List(camAClip, camBClip),
+        multicams = List(group),
+        tracks = List(
+          Track("v1", "V1", MediaKind.Video, cuts),
+          Track("a1", "A1", MediaKind.Audio, bed),
+        ),
+      )
+      Player.probe(proj, 30, "probe-mc-a.png")      // inside the Cam A cut
+      Player.probe(proj, 90, "probe-mc-b.png")      // inside the Cam B cut
+      Player.probe(proj, 150, "probe-mc-title.png") // inside the title cut
+      Player.renderAudio(proj, "/tmp/kutter-mc-audio.wav")
+      Mlt.close()
+      println(s"multicam program: ${cuts.map(c => s"[${c.timelineStart},${c.timelineEnd})#${c.angle}").mkString(" ")}")
+      println("multicam render wrote probe-mc-a.png (Cam A), probe-mc-b.png (Cam B), probe-mc-title.png (title slide)")
+      println("multicam audio bed -> /tmp/kutter-mc-audio.wav (one continuous source across the cuts)")
       return true
 
     false
