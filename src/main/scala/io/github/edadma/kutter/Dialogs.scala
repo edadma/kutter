@@ -118,6 +118,89 @@ private val SettingsDialog: Component[SettingsProps] = component[SettingsProps] 
   )
 }
 
+/** The export-settings dialog: choose the container, video and audio codecs, and quality before an
+  * encode. The video and audio dropdowns list every codec (not only the ones the container allows), so an
+  * invalid pick is possible and is surfaced live — a danger-coloured line names the conflict and the
+  * Export button is disabled until it is resolved. Changing the container keeps the current codecs when
+  * they are still legal and otherwise snaps them to that container's defaults, so switching format is
+  * smooth while a deliberate bad codec still teaches why it will not mux. Export proceeds to a save dialog
+  * for the path. */
+private final case class ExportSettingsProps(
+    open:     Boolean,
+    draft:    ExportSettings,
+    onChange: (ExportSettings => ExportSettings) => Unit,
+    onExport: () => Unit,
+    onClose:  () => Unit,
+)
+
+private val ExportSettingsDialog: Component[ExportSettingsProps] = component[ExportSettingsProps] { p =>
+  val theme = useTheme()
+  val d     = p.draft
+  val w     = 396
+
+  def note(msg: String): VNode = text(msg, size = 11, color = theme.border, maxLines = 0)
+
+  // The quality control for the chosen video codec: ProRes is profile-based (a fixed HQ note); a
+  // CRF-capable codec offers a mode toggle (constant quality vs target bitrate) with the matching field;
+  // the older codecs take a bitrate only.
+  def qualityControls: VNode =
+    if d.video == VideoCodec.ProRes then
+      KutterUi.labeled(theme)("Quality")(note("ProRes uses a fixed HQ profile."))
+    else if d.video.crf then
+      col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 14)(
+        KutterUi.labeled(theme)("Quality mode")(
+          Select(
+            List("crf" -> "Constant quality (CRF)", "br" -> "Target bitrate"),
+            if d.useCrf then "crf" else "br",
+            v => p.onChange(_.copy(useCrf = v == "crf")), width = w - 24),
+        ),
+        if d.useCrf then
+          KutterUi.labeled(theme)("CRF — lower is better (18–24 typical)")(
+            KutterUi.intField(d.crf, v => p.onChange(_.copy(crf = math.max(0, math.min(51, v))))))
+        else
+          KutterUi.labeled(theme)("Video bitrate (kbps)")(
+            KutterUi.intField(d.videoBitrateK, v => p.onChange(_.copy(videoBitrateK = math.max(100, v))))),
+      )
+    else
+      KutterUi.labeled(theme)("Video bitrate (kbps)")(
+        KutterUi.intField(d.videoBitrateK, v => p.onChange(_.copy(videoBitrateK = math.max(100, v)))))
+
+  Dialog(open = p.open, onClose = p.onClose, width = 440)(
+    sizedBox(width = w)(
+      col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 14)(
+        text("Export Video", size = 16, weight = FontWeight.Bold, color = theme.surfaceText),
+        KutterUi.labeled(theme)("Container")(
+          Select(Container.values.toList.map(c => (c.ext, c.label)), d.container.ext,
+            v => Container.fromExt(v).foreach(c => p.onChange(s => ExportSettings.withContainer(s, c))), width = w - 24),
+        ),
+        KutterUi.labeled(theme)("Video codec")(
+          Select(VideoCodec.values.toList.map(c => (c.id, c.label)), d.video.id,
+            v => VideoCodec.fromId(v).foreach(c => p.onChange(_.copy(video = c))), width = w - 24),
+        ),
+        qualityControls,
+        KutterUi.labeled(theme)("Audio codec")(
+          Select(AudioCodec.values.toList.map(c => (c.id, c.label)), d.audio.id,
+            v => AudioCodec.fromId(v).foreach(c => p.onChange(_.copy(audio = c))), width = w - 24),
+        ),
+        if d.audio.lossless then KutterUi.labeled(theme)("Audio")(note("Uncompressed — no bitrate to set."))
+        else
+          KutterUi.labeled(theme)("Audio bitrate (kbps)")(
+            Select(List(128, 192, 256, 320).map(b => (b.toString, s"$b kbps")), d.audioBitrateK.toString,
+              v => v.toIntOption.foreach(b => p.onChange(_.copy(audioBitrateK = b))), width = w - 24)),
+        // Live validation: an invalid container/codec combination shows here and disables Export.
+        d.validate match
+          case Some(msg) => text(msg, size = 12, color = theme.danger, maxLines = 0)
+          case None      => note(s"Output: a ${d.container.label} file (.${d.container.ext})."),
+        row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 10)(
+          spacer(),
+          KutterUi.textButton(theme)("Cancel", p.onClose),
+          KutterUi.textButton(theme)("Export…", p.onExport, enabled = d.isValid),
+        ),
+      ),
+    ),
+  )
+}
+
 /** The export-progress dialog: a determinate bar over the encode, not dismissable by the scrim (the
   * export is running behind it), with a Cancel that stops it. */
 private final case class ExportProps(open: Boolean, progress: Double, onCancel: () => Unit)

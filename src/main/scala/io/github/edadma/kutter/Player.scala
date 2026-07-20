@@ -736,24 +736,21 @@ object Player:
       built.close()
       profile.close()
 
-  /** Start exporting `project` to the video file `out`, encoded H.264/AAC in the container the path's
-    * extension names, against the project's own timeline spec. Returns at once with a [[RenderJob]] to
-    * poll — the encode runs on MLT's worker threads. **Must run on the main thread**: it builds the
-    * graph, and MLT producer creation is main-thread-only. A constant-quality (CRF 20) encode, a
-    * sensible default; explicit bitrate/codec choices can layer on later. */
-  def startRender(project: Project, out: String): RenderJob =
+  /** Start exporting `project` to the video file `out`, encoded per `settings` (container, codecs, and
+    * quality) against the project's own timeline spec. Returns at once with a [[RenderJob]] to poll — the
+    * encode runs on MLT's worker threads. **Must run on the main thread**: it builds the graph, and MLT
+    * producer creation is main-thread-only. The caller is expected to have validated `settings`
+    * (`ExportSettings.isValid`); the format/codec/quality properties come straight from it, and the audio
+    * rate and channels from the timeline spec. */
+  def startRender(project: Project, out: String, settings: ExportSettings): RenderJob =
     val profile  = profileFor(project.spec)
     val built    = buildGraph(profile, project)
     val consumer = Consumer(profile, "avformat", Some(out))
     consumer.realTime         = 0    // encode as fast as the machine allows, dropping nothing
     consumer.terminateOnPause = true // stop when the base track's speed hits 0 (the timeline's end)
-    consumer.set("vcodec", "libx264")
-    consumer.set("crf", "20")              // constant quality — visually near-lossless, sensible size
-    consumer.set("acodec", "aac")
-    consumer.set("ab", "192k")             // audio bitrate
+    for (k, v) <- settings.consumerProps do consumer.set(k, v)
     consumer.set("frequency", project.spec.audioRate.toString)
     consumer.set("channels", AudioChannels.toString)
-    consumer.set("movflags", "+faststart") // web-friendly: index at the front so it streams before fully downloaded
     consumer.connect(built.tractor)
     consumer.start()
     new RenderJob(profile, consumer, built)

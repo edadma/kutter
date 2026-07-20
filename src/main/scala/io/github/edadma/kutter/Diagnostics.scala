@@ -505,6 +505,37 @@ private[kutter] object Diagnostics:
       check("title placement roundtrip", titleProj.toJson.fromJson[Project].map(_.tracks.head.clips.head.titleId), Right(Some("ttl")))
       check("titleFor resolves", titleProj.titleFor("ttl").map(_.name), Some("Name"))
 
+      // Export settings: the container/codec validation and the avformat property mapping. The default is
+      // a valid MP4 H.264/AAC; an invalid combination (H.264 in WebM, or AAC in WebM) is caught with a
+      // message; switching container keeps a still-legal codec but snaps an illegal one to the container's
+      // default. The property mapping turns a settings value into the consumer keys MLT is configured from.
+      check("export default valid", ExportSettings.default.isValid, true)
+      check("export webm h264 invalid", ExportSettings.default.copy(container = Container.WebM).isValid, false)
+      check("export webm vp9 opus valid", ExportSettings(Container.WebM, VideoCodec.VP9, AudioCodec.Opus, true, 32, 8000, 128).isValid, true)
+      check("export mp4 pcm invalid", ExportSettings.default.copy(audio = AudioCodec.PCM).isValid, false)
+      // withContainer snaps illegal codecs to the new container's defaults, keeps legal ones.
+      val toWebm = ExportSettings.withContainer(ExportSettings.default, Container.WebM)
+      check("switch container snaps codecs", (toWebm.video, toWebm.audio), (VideoCodec.VP9, AudioCodec.Opus))
+      val h264ToMkv = ExportSettings.withContainer(ExportSettings.default, Container.Mkv)
+      check("switch container keeps legal", (h264ToMkv.video, h264ToMkv.audio), (VideoCodec.H264, AudioCodec.AAC))
+      // Property mapping: MP4 H.264/AAC CRF → the muxer, both codecs, crf, audio bitrate, faststart.
+      val mp4Props = ExportSettings.default.consumerProps.toMap
+      check("props mp4 muxer", mp4Props.get("f"), Some("mp4"))
+      check("props mp4 vcodec", mp4Props.get("vcodec"), Some("libx264"))
+      check("props mp4 crf", mp4Props.get("crf"), Some("20"))
+      check("props mp4 ab", mp4Props.get("ab"), Some("192k"))
+      check("props mp4 faststart", mp4Props.get("movflags"), Some("+faststart"))
+      // VP9 CRF also pins vb=0 so rate control is quality-only; WMV muxes as asf; PCM carries no bitrate;
+      // a bitrate-mode H.264 uses vb, not crf.
+      val vp9Props = ExportSettings(Container.WebM, VideoCodec.VP9, AudioCodec.Opus, true, 32, 8000, 128).consumerProps.toMap
+      check("props vp9 crf vb0", (vp9Props.get("crf"), vp9Props.get("vb")), (Some("32"), Some("0")))
+      check("props webm no faststart", vp9Props.get("movflags"), None)
+      check("props wmv muxer asf", ExportSettings(Container.Wmv, VideoCodec.WMV2, AudioCodec.WMA, false, 20, 6000, 128).consumerProps.toMap.get("f"), Some("asf"))
+      check("props pcm no bitrate", ExportSettings(Container.Mov, VideoCodec.ProRes, AudioCodec.PCM, false, 20, 8000, 192).consumerProps.toMap.get("ab"), None)
+      check("props prores profile", ExportSettings(Container.Mov, VideoCodec.ProRes, AudioCodec.PCM, false, 20, 8000, 192).consumerProps.toMap.get("vprofile"), Some("3"))
+      val brProps = ExportSettings.default.copy(useCrf = false).consumerProps.toMap
+      check("props bitrate mode vb", (brProps.get("vb"), brProps.get("crf")), (Some("8000k"), None))
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true
@@ -608,17 +639,17 @@ private[kutter] object Diagnostics:
       println(s"fixed-track render (frame $f) wrote probe-nle.png")
       return true
 
-    // `KUTTER_PROBE_EXPORT` runs the real export path — `Player.startRender` encoding a short
-    // fixed-track project (a video clip on V1, its audio on A1, a lower third on top) to an H.264/AAC
-    // mp4, polled to completion exactly as the GUI does. It checks that the render job runs and finishes
-    // and that a non-trivial file lands on disk — the whole timeline-to-video pipeline off the GUI.
-    // Output path from `KUTTER_EXPORT_OUT` (default probe-export.mp4).
+    // `KUTTER_PROBE_EXPORT` runs the real export path — `Player.startRender` encoding a short fixed-track
+    // project (a video clip on V1, its audio on A1, a title on top) — once per representative
+    // container/codec/quality combination, polling each to completion exactly as the GUI does and checking
+    // a non-trivial file lands. This is the real test that the `ExportSettings` property mapping muxes on
+    // every backend format (MP4/WebM/MOV/MKV/AVI/WMV) across the CRF, profile, and bitrate quality paths.
     if sys.env.contains("KUTTER_PROBE_EXPORT") then
       Mlt.init()
-      val out  = sys.env.getOrElse("KUTTER_EXPORT_OUT", "probe-export.mp4")
+      val dir  = sys.env.getOrElse("KUTTER_EXPORT_DIR", System.getProperty("java.io.tmpdir"))
       val src  = "big_buck_bunny_720p.mp4"
       val spec = Player.probeSpec(src)
-      val len  = math.min(60, Player.mediaLength(src, spec)) // a short clip keeps the encode quick
+      val len  = math.min(30, Player.mediaLength(src, spec)) // a short clip keeps each encode quick
       val clip = MediaClip.make(src, MediaKind.Video, len)
       val proj = withTitles(
         Project.blank.withSpec(spec).copy(
@@ -630,18 +661,32 @@ private[kutter] object Diagnostics:
         ),
         List((LowerThird("t", "Exported", "from the timeline"), 0, math.max(1, len - 1))),
       )
-      val job = Player.startRender(proj, out)
-      var waited = 0
-      while !job.isDone && waited < 60000 do Thread.sleep(50); waited += 50
-      val done = job.isDone
-      job.finish()
+      import ExportSettings as ES
+      val cases = List(
+        ES.default,                                                                                  // MP4  H.264/AAC, CRF
+        ES(Container.WebM, VideoCodec.VP9,    AudioCodec.Opus, useCrf = true,  crf = 32, 8000, 128),  // WebM VP9/Opus, CRF (vb=0)
+        ES(Container.Mov,  VideoCodec.ProRes, AudioCodec.PCM,  useCrf = false, crf = 20, 8000, 192),  // MOV  ProRes/PCM, profile + lossless
+        ES(Container.Mkv,  VideoCodec.H265,   AudioCodec.MP3,  useCrf = true,  crf = 24, 8000, 192),  // MKV  H.265/MP3, CRF
+        ES(Container.Avi,  VideoCodec.MPEG4,  AudioCodec.MP3,  useCrf = false, crf = 20, 6000, 192),  // AVI  MPEG-4/MP3, bitrate
+        ES(Container.Wmv,  VideoCodec.WMV2,   AudioCodec.WMA,  useCrf = false, crf = 20, 6000, 128),  // WMV  WMV2/WMA (asf), bitrate
+      )
+      var allOk = true
+      for s <- cases do
+        val out = s"$dir/probe-export-${s.container.ext}.${s.container.ext}"
+        new File(out).delete()
+        val job = Player.startRender(proj, out, s)
+        var waited = 0
+        while !job.isDone && waited < 60000 do Thread.sleep(50); waited += 50
+        val done = job.isDone
+        job.finish()
+        val f    = new File(out)
+        val size = if f.exists() then f.length() else 0L
+        val ok   = done && f.exists() && size >= 1024
+        if !ok then allOk = false
+        println(f"${if ok then "OK  " else "FAIL"} ${s.container.label}%-20s ${s.video.label}%-16s ${s.audio.label}%-20s -> ${size} bytes")
       Mlt.close()
-      val f    = new File(out)
-      val size = if f.exists() then f.length() else 0L
-      println(f"export ${spec.width}x${spec.height}@${spec.fps}%.3f, $len frames -> $out")
-      println(s"  finished=$done  exists=${f.exists()}  bytes=$size")
-      if !done || !f.exists() || size < 1024 then { println("EXPORT PROBE FAILED"); sys.exit(1) }
-      println("EXPORT PROBE OK")
+      println(if allOk then "EXPORT PROBE OK" else "EXPORT PROBE FAILED")
+      if !allOk then sys.exit(1)
       return true
 
     // `KUTTER_PROBE_MULTICAM` renders a switched multicam program off the GUI: a group of three synced

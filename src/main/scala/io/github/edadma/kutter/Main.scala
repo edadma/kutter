@@ -78,6 +78,12 @@ private val App: Component[Session] = component[Session] { initial =>
   val exportJob = useRef[Player.RenderJob | Null](null)
   val exportOut = useRef("")
 
+  // The export-settings dialog: whether it is open, and the format/codec/quality draft it edits. The draft
+  // persists across exports within a session (it does not reset to the default each time), so a chosen
+  // format is remembered.
+  val (exportSettingsOpen, setExportSettingsOpen, _)       = useState(false)
+  val (exportDraft, setExportDraft, updateExportDraft)     = useState(ExportSettings.default)
+
   // The video layer, once the player has opened the project and created its texture. Null until the
   // mount effect runs, so the first render shows a placeholder rather than an empty hole.
   val (layer, setLayer, _) = useState[VideoLayer | Null](null)
@@ -581,30 +587,44 @@ private val App: Component[Session] = component[Session] { initial =>
       editProject(_ => renamed)
 
   // Export the timeline to a video file. Nothing to render on an empty timeline, so that is a gentle
-  // notice; otherwise a save dialog picks the path and the encode begins.
-  val exportFilter = Seq(FileDialog.Filter("Video", "mp4;mov"))
-
+  // notice; otherwise the export-settings dialog opens to choose the format, codecs, and quality, and its
+  // Export button proceeds to the save dialog and the encode.
   def requestExport(): Unit =
     if !hasContent(project) then
       setConfirm(Some(ConfirmSpec("Nothing to export",
-        "Place some media or a lower third on the timeline before exporting a video.", "OK", () => ())))
+        "Place some media or a title on the timeline before exporting a video.", "OK", () => ())))
+    else setExportSettingsOpen(true)
+
+  // Proceed from the settings dialog to a save dialog for the path, then the encode — using the chosen
+  // container's extension as the default and its filter. A guard on validity keeps an invalid combination
+  // (which the dialog already disables Export for) from ever reaching MLT.
+  def proceedExport(): Unit =
+    if !exportDraft.isValid then ()
     else
-      FileDialog.save(filters = exportFilter, defaultLocation = s"${project.name}.mp4", title = "Export video") {
+      setExportSettingsOpen(false)
+      val ext = exportDraft.container.ext
+      FileDialog.save(
+        filters         = Seq(FileDialog.Filter(exportDraft.container.label, ext)),
+        defaultLocation = s"${project.name}.$ext",
+        title           = "Export video",
+      ) {
         case FileDialog.Result.Chosen(paths) => startExport(paths.head)
         case _                               => ()
       }
 
-  // Begin encoding `outPath` (forcing a video extension). Playback is paused first so the export owns
-  // the machine, then the render job is started and the progress dialog opens; the poll above advances
-  // and finishes it. Producer creation is on this (UI/main) thread, as MLT requires.
+  // Begin encoding `outPath` (forcing the chosen container's extension) with the current export settings.
+  // Playback is paused first so the export owns the machine, then the render job is started and the
+  // progress dialog opens; the poll above advances and finishes it. Producer creation is on this (UI/main)
+  // thread, as MLT requires.
   def startExport(outPath: String): Unit =
-    val out = if outPath.endsWith(".mp4") || outPath.endsWith(".mov") then outPath else s"$outPath.mp4"
+    val ext = exportDraft.container.ext
+    val out = if outPath.toLowerCase.endsWith(s".$ext") then outPath else s"$outPath.$ext"
     playerRef.current match
       case p: Player => p.pause(); setPlaying(false)
       case null      => ()
     try
       exportOut.current = out
-      exportJob.current = Player.startRender(project, out)
+      exportJob.current = Player.startRender(project, out, exportDraft)
       setExportProgress(0.0)
       setExporting(true)
     catch
@@ -1061,6 +1081,13 @@ private val App: Component[Session] = component[Session] { initial =>
     onApply   = () => applySettings(),
     onClose   = () => setSettingsOpen(false),
   ))
+  val exportSettingsDialog = ExportSettingsDialog(ExportSettingsProps(
+    open     = exportSettingsOpen,
+    draft    = exportDraft,
+    onChange = updateExportDraft,
+    onExport = () => proceedExport(),
+    onClose  = () => setExportSettingsOpen(false),
+  ))
   val exportDialog = ExportDialog(ExportProps(exporting, exportProgress, () => cancelExport()))
 
   ThemeProvider(theme)(
@@ -1071,6 +1098,7 @@ private val App: Component[Session] = component[Session] { initial =>
       ),
       confirmDialog,
       settingsDialog,
+      exportSettingsDialog,
       exportDialog,
     ),
   )
