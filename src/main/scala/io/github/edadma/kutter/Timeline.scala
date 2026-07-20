@@ -232,16 +232,26 @@ object Timeline:
           else project.updateTrack(tid)(x => x.copy(clips = x.clips :+ PlacedClip.make(clipId, start, length)))
         (clip.kind, pt.kind) match
           case (MediaKind.Video, MediaKind.Video) =>
-            project.audioTracks.headOption match
-              case Some(at) =>
-                val (start, length) = freePlacement(frame, srcLen, blocksOf(pt.clips), blocksOf(at.clips))
-                if length <= 0 then project
-                else
-                  val link = Some(s"lnk-${System.nanoTime()}")
-                  project.copy(tracks = project.tracks.map(t =>
-                    if t.id == pt.id || t.id == at.id then t.copy(clips = t.clips :+ PlacedClip.make(clipId, start, length, link = link))
-                    else t))
-              case None => onOne(_ => (pt.id, pt.clips))
+            // Pair the picture with the audio track that shares this video track's number — V2's sound goes
+            // to A2, V3's to A3 — created if it does not exist yet, so each camera's sound lands on its own
+            // lane, aligned under its picture. (Always sending it to A1 was the bug: a second camera on V2
+            // collided with the first camera's audio there, and when A1 was full at the drop point the
+            // placement had no room and silently did nothing.)
+            val (withAt, at) = pt.num.flatMap(n => project.audioTracks.find(_.num.contains(n))) match
+              case Some(a) => (project, a)
+              case None =>
+                val an = pt.num.getOrElse(project.tracks.flatMap(_.num).maxOption.getOrElse(0) + 1)
+                // The project `Track`, fully qualified — inside `object Timeline` the bare name is the
+                // nested block model, not the project track.
+                val na = io.github.edadma.kutter.Track(s"trk-${System.nanoTime()}", s"A$an", MediaKind.Audio)
+                (project.copy(tracks = project.tracks :+ na), na)
+            val (start, length) = freePlacement(frame, srcLen, blocksOf(pt.clips), blocksOf(at.clips))
+            if length <= 0 then project
+            else
+              val link = Some(s"lnk-${System.nanoTime()}")
+              withAt.copy(tracks = withAt.tracks.map(t =>
+                if t.id == pt.id || t.id == at.id then t.copy(clips = t.clips :+ PlacedClip.make(clipId, start, length, link = link))
+                else t))
           case (MediaKind.Audio, MediaKind.Audio) => onOne(_ => (pt.id, pt.clips))
           case _                                  => project // an incompatible clip/track pairing: no drop
       case _ => project

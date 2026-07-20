@@ -947,8 +947,14 @@ private val App: Component[Session] = component[Session] { initial =>
   // composites over the others and draws highest); a new audio track joins the end of the audio group.
   // Numbered by how many of its kind already exist. An empty track adds no generators, so it rides the
   // live graph-swap like any structural-but-media-unchanged edit.
+  // The next free track number — one past the highest any track already uses, across both kinds. Track
+  // numbers are a single sequence: a new standalone track takes a fresh number, so it never claims one an
+  // existing track of the other kind holds (a video track and an audio track share a number only when they
+  // are a deliberate pair). So V1/A1, then +Video → V2, then +Audio → A3, not A2.
+  def nextTrackNum: Int = project.tracks.flatMap(_.num).maxOption.getOrElse(0) + 1
+
   def addTrack(kind: MediaKind): Unit =
-    val n  = project.tracks.count(_.kind == kind) + 1
+    val n  = nextTrackNum
     val nt = Track(s"trk-${System.nanoTime()}", s"${if kind == MediaKind.Video then "V" else "A"}$n", kind)
     val tracks = kind match
       case MediaKind.Video =>
@@ -956,6 +962,16 @@ private val App: Component[Session] = component[Session] { initial =>
         (vids :+ nt) ++ auds
       case MediaKind.Audio => project.tracks :+ nt
     editProject(_.copy(tracks = tracks))
+
+  // Add a video track and an audio track together — a camera's worth of lanes in one go, sharing one
+  // number (the new Vn and An), so they read as a pair and a video clip dropped on the video half pairs its
+  // sound to the audio half. The common multicam gesture: one click per camera.
+  def addAvTracks(): Unit =
+    val n  = nextTrackNum
+    val vt = Track(s"trkv-${System.nanoTime()}", s"V$n", MediaKind.Video)
+    val at = Track(s"trka-${System.nanoTime()}", s"A$n", MediaKind.Audio)
+    val (vids, auds) = project.tracks.partition(_.kind == MediaKind.Video)
+    editProject(_.copy(tracks = (vids :+ vt) ++ (auds :+ at)))
 
   val timelinePanel = TimelinePanel(TimelineProps(
     project             = project,
@@ -976,6 +992,7 @@ private val App: Component[Session] = component[Session] { initial =>
     onRemovePlacement   = removePlacement,
     onRemoveLowerThird  = removeLowerThird,
     onAddTrack          = addTrack,
+    onAddAvTracks       = () => addAvTracks(),
   ))
 
   // The editor body, Resolve-style: a top row of bin | player | inspector — split by draggable

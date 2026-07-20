@@ -256,6 +256,12 @@ final case class Track(
   /** The effective linear gain: 0 when muted, else the fader value. */
   def gain: Double = if muted then 0.0 else volume
 
+  /** The track's number parsed from its name (V2 → 2, A3 → 3), or None for a name that isn't the
+    * letter-plus-number form (a multicam lane). A video track and an audio track that share a number are a
+    * pair — one camera's picture and its sound — so a standalone track takes the next free number rather
+    * than one already claimed by a track of the other kind. */
+  def num: Option[Int] = name.drop(1).toIntOption
+
 object Track:
   given JsonCodec[Track] = DeriveJsonCodec.gen
 

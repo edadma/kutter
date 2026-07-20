@@ -470,6 +470,21 @@ private[kutter] object Diagnostics:
       check("dropClip audio on a1", Timeline.dropClip(dcBase, dcAud.id, "a1", 50, 200).tracks.find(_.id == "a1").get.clips.map(c => (c.timelineStart, c.length)), List((50, 200)))
       check("dropClip mismatch noop", Timeline.dropClip(dcBase, dcAud.id, "v1", 0, 200) eq dcBase, true)
 
+      // A second camera on V2 pairs its sound to A2 (the audio track alongside it), not A1 — so cameras
+      // don't collide on one audio lane; and dropping on a video track with no matching audio track
+      // creates one for it.
+      val dc4 = Project.blank.copy(bin = List(dcVid), tracks = List(
+        Track("v1", "V1", MediaKind.Video), Track("v2", "V2", MediaKind.Video),
+        Track("a1", "A1", MediaKind.Audio), Track("a2", "A2", MediaKind.Audio)))
+      val dvp = Timeline.dropClip(dc4, dcVid.id, "v2", 30, 200)
+      check("dropClip V2 pairs A2", dvp.tracks.find(_.id == "a2").get.clips.map(c => (c.timelineStart, c.length)), List((30, 200)))
+      check("dropClip V2 leaves A1", dvp.tracks.find(_.id == "a1").get.clips.isEmpty, true)
+      val dc5 = Project.blank.copy(bin = List(dcVid), tracks = List(
+        Track("v1", "V1", MediaKind.Video), Track("v2", "V2", MediaKind.Video), Track("a1", "A1", MediaKind.Audio)))
+      val dvp5 = Timeline.dropClip(dc5, dcVid.id, "v2", 30, 200)
+      check("dropClip V2 creates audio track", dvp5.audioTracks.size, 2)
+      check("dropClip V2 new track paired", dvp5.audioTracks.last.clips.map(_.length), List(200))
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true
