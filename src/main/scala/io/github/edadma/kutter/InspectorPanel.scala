@@ -83,6 +83,6 @@ private val InspectorPanel: Component[InspectorProps] = component[InspectorProps
         case Some((pc, lt)) => titlePlacementBody(pc, lt)
         case None => p.selectedLt match
           case Some(lt) => binTitleBody(lt)
-          case None     => KutterUi.placeholder(theme)("Select a clip or lower third"),
+          case None     => KutterUi.placeholder(theme)("Select a clip or title"),
   )
 }
