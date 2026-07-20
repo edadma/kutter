@@ -14,6 +14,18 @@ import io.github.edadma.logger.LoggerFactory
 // It pulls the clip frame by frame and, for each, reduces that frame's audio to a single peak (the
 // largest absolute sample across both channels). Only the audio is decoded — the image is never
 // asked for — so the pass is far cheaper than the thumbnail decode.
+object Waveform:
+  /** A source's whole peak envelope, generated synchronously (blocking the caller) — for offline audio
+    * sync when no live waveform is on hand, e.g. building a multicam group from bin clips that have not
+    * been placed. It caches to disk like any waveform, so a repeat is instant. */
+  def envelopeOf(spec: TimelineSpec, path: String, count: Int): Array[Float] =
+    val w = new Waveform(math.max(1, count))
+    w.start(spec, path)
+    w.awaitComplete()
+    val e = w.envelope
+    w.close()
+    e
+
 final class Waveform(count: Int):
   private val log = LoggerFactory.getLogger
 

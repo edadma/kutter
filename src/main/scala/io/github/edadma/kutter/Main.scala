@@ -620,43 +620,24 @@ private val App: Component[Session] = component[Session] { initial =>
   val videoFilter = Seq(FileDialog.Filter("Video", "mp4;mov;m4v;mkv;webm;avi"))
   val audioFilter = Seq(FileDialog.Filter("Audio", "mp3;wav;m4a;aac;flac;ogg"))
 
-  // Append `clip` to the end of `track` (a placement `len` frames long at the track's content end),
-  // returning the updated project. Used to build up a track by importing clips.
-  def appendTo(p: Project, trackId: String, clip: MediaClip, len: Int, link: Option[String]): Project =
-    p.updateTrack(trackId)(t => t.copy(clips = t.clips :+ PlacedClip.make(clip.id, t.contentEnd, len, link = link)))
-
-  // Import a clip of `kind` into the bin and place it, then re-open the player on it. Placing a clip
-  // changes the timeline lanes (each owns a background generator), so this rebuilds the player from
-  // scratch rather than the live graph-swap the lower-third edits use. The clip's length is measured
-  // against the profile (a producer, so on the UI/main thread).
+  // Import a clip of `kind` into the BIN. Importing is not placing: the clip joins the bin's source list
+  // and nothing lands on a track — the user places it deliberately (the bin row's Place), choosing where
+  // it goes, rather than every import piling onto V1/A1. The clip's length is measured against the profile
+  // (a producer, so on the UI/main thread) and kept on the bin clip for later placement and trimming.
   //
-  // A **video** clip is placed as a linked A/V pair — its picture on the first video track and its
-  // audio on the first audio track, sharing a link id and the same window — so A1 shows the video's
-  // peaks under the picture (for clapper/audio sync) and its sound plays from the audio track. An
-  // **audio** clip goes on the first audio track alone. Stage 1 appends; dragging a bin clip to an
-  // arbitrary track position, and unlinking a pair, come with the timeline UI.
+  // A first video into a fresh project sets the timeline format from its own (auto-adopt); later clips —
+  // and audio clips, which carry no video format to adopt — are conformed to whatever the timeline already
+  // is. The audio rate is never adopted (resampling is transparent). Adding to the bin is a plain project
+  // edit, so it rides the ordinary re-render; there is no player work, nothing new being on the timeline.
   def importClip(pathStr: String, kind: MediaKind): Unit =
-    dirty.current = true
-    // A first video clip into a fresh project sets the timeline format from its own (auto-adopt); later
-    // clips — and audio clips, which carry no video format to adopt — are conformed to whatever the
-    // timeline already is. The audio rate is never adopted (resampling is transparent), so the project's
-    // is kept. Measuring the clip's length happens against the resulting spec, so the length is in
-    // timeline frames.
     val base =
       if kind == MediaKind.Video && project.shouldAdoptSpec then
         project.withSpec(Player.probeSpec(pathStr).copy(audioRate = project.spec.audioRate))
       else project
-    val len      = Player.mediaLength(pathStr, base.spec)
-    val clip     = MediaClip.make(pathStr, kind, len)
-    val withClip = base.copy(bin = base.bin :+ clip)
-    val placed = kind match
-      case MediaKind.Video =>
-        val link = Some(s"lnk-${System.nanoTime()}")
-        val onV  = base.videoTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, link)).getOrElse(withClip)
-        base.audioTracks.headOption.map(t => appendTo(onV, t.id, clip, len, link)).getOrElse(onV)
-      case MediaKind.Audio =>
-        base.audioTracks.headOption.map(t => appendTo(withClip, t.id, clip, len, None)).getOrElse(withClip)
-    reopen(placed, path)
+    val len  = Player.mediaLength(pathStr, base.spec)
+    val clip = MediaClip.make(pathStr, kind, len)
+    dirty.current = true
+    editProject(_ => base.copy(bin = base.bin :+ clip))
 
   def doImportVideo(): Unit =
     FileDialog.open(filters = videoFilter, title = "Import video") {
@@ -818,9 +799,15 @@ private val App: Component[Session] = component[Session] { initial =>
   def makeMulticam(): Unit =
     val vids = project.bin.filter(_.kind == MediaKind.Video)
     if vids.size >= 2 then
-      val envs = vids.map(c => c.path -> (playerRef.current match
-        case pl: Player => pl.waveFor(c.path) match { case w: Waveform => w.envelope; case null => Array.empty[Float] }
-        case null       => Array.empty[Float])).toMap
+      // Envelopes to sync on: the live waveform when the clip is already placed, otherwise generated on
+      // demand (bin clips are no longer auto-placed, so a group is usually built from unplaced sources).
+      val envs = vids.map { c =>
+        val live = playerRef.current match { case pl: Player => pl.waveFor(c.path); case null => null }
+        val env = live match
+          case w: Waveform if w.envelope.nonEmpty => w.envelope
+          case _ => Waveform.envelopeOf(project.spec, c.path, if c.frames > 0 then c.frames else Player.mediaLength(c.path, project.spec))
+        c.path -> env
+      }.toMap
       val length      = math.max(1, if vids.head.frames > 0 then vids.head.frames else Player.mediaLength(vids.head.path, project.spec))
       val (g, vt, at) = Multicam.buildProgram(vids, envs, math.round(fps * 2).toInt, length)
       val angleIds    = vids.map(_.id).toSet
