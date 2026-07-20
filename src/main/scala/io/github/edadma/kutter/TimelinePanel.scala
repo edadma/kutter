@@ -522,10 +522,12 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       onWheel = wheelPan,
     )(paint)
 
-  // A small zoom control for the ruler's corner: a boxed glyph that acts on press.
+  // A small zoom control for the ruler's corner: a filled, rounded, bordered chip so it reads as a
+  // button, acting on press. Kept compact (three sit in the narrow label column).
   def zoomButton(glyph: String, act: () => Unit): VNode =
-    box(onClick = _ => act(), cursor = Cursor.Pointer, padding = EdgeInsets.symmetric(horizontal = 3, vertical = 0))(
-      text(glyph, size = 11, weight = FontWeight.Bold, color = theme.border),
+    box(onClick = _ => act(), cursor = Cursor.Pointer, bg = theme.background, radius = 4,
+      border = theme.border, borderWidth = 1, padding = EdgeInsets.symmetric(horizontal = 4, vertical = 1))(
+      text(glyph, size = 10, weight = FontWeight.Bold, color = theme.surfaceText),
     )
 
   // The time ruler, pinned across the top of the track panel. Its left is the width of the track
@@ -536,7 +538,7 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       row(crossAxisAlignment = CrossAxisAlignment.Stretch)(
         sizedBox(width = Timeline.LabelWidth)(
           box(bg = theme.surface)(
-            row(mainAxisAlignment = MainAxisAlignment.Center, crossAxisAlignment = CrossAxisAlignment.Center)(
+            row(mainAxisAlignment = MainAxisAlignment.Center, crossAxisAlignment = CrossAxisAlignment.Center, spacing = 3)(
               zoomButton("−", () => zoomTimeline(1 / 1.5)),
               zoomButton("fit", () => zoomFit()),
               zoomButton("+", () => zoomTimeline(1.5)),
@@ -638,7 +640,6 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       // track stacks atop the video group; a new audio track goes below.
       box(bg = theme.background, padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
         row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-          text("Add track", size = 11, weight = FontWeight.Bold, color = theme.border),
           spacer(),
           KutterUi.textButton(theme)("+ A/V", () => p.onAddAvTracks()),
           KutterUi.textButton(theme)("+ Video", () => p.onAddTrack(MediaKind.Video)),

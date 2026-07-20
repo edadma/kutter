@@ -13,7 +13,7 @@ object Timeline:
 
   val RulerHeight = 22.0 // the time-ruler widget's height
   val TrackHeight = 68.0 // one track widget's height
-  val LabelWidth  = 60.0 // the track-name column down the left, as in any editor; the ruler leaves it blank
+  val LabelWidth  = 72.0 // the track-name column down the left, as in any editor; also holds the ruler's zoom chips
 
   /** The working timeline length (in frames at the 30fps profile) a project has before any footage is
     * placed, so lower thirds can be laid out ahead of the video — 10 seconds. */
