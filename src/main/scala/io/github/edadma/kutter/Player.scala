@@ -517,9 +517,11 @@ object Player:
     *     full-frame onto the base; video tracks composite in order, so a higher track shows over a lower
     *     one where they overlap and the lower shows through the higher's gaps;
     *   - each **audio track** is a playlist that mixes its sound into the base, its `volume` filter
-    *     applying the track's fader (silenced when the track is muted);
-    *   - each **lower third** composites its card onto the base, faded in and out over its window by the
-    *     card's own animated alpha.
+    *     applying the track's fader (silenced when the track is muted).
+    *
+    * A lower third is not a track of its own: it is placed on a video track (a `titleId` placement),
+    * where its card composites over the tracks below and fades in and out over its window by the card's
+    * own animated alpha.
     *
     * A mix transition on every track carries its audio through to the tractor's output. The project's
     * master level is applied at the audio device (see `setVolume`), not in the graph.
@@ -529,10 +531,8 @@ object Player:
   private def buildGraph(profile: Profile, project: Project): BuildResult =
     import scala.collection.mutable.ListBuffer
 
-    val ltExtent = project.lowerThirds.map(_.outFrame + 1).maxOption.getOrElse(0)
-    val extent   = project.contentEnd
-    val length =
-      math.max(1, if extent > 0 then math.max(extent, ltExtent) else math.max(DefaultLength, ltExtent))
+    val extent = project.contentEnd
+    val length = math.max(1, if extent > 0 then extent else DefaultLength)
 
     // Everything created here, kept for teardown in reverse order of dependence.
     val clipProds = ListBuffer.empty[Producer]
@@ -566,18 +566,20 @@ object Player:
       val pl     = Playlist(profile)
       var cursor = 0
       for pc <- track.ordered do
-        // A multicam title cut draws its angle's card full-frame — a title cut is treated as a video clip
-        // — so it is resolved from the group here; every other placement (an ordinary clip, or a multicam
-        // clip-angle cut, whose source id and in-point are already on the placement) is its bin source.
-        val titleAngle =
-          pc.mc.flatMap(project.mcFor).flatMap(_.angleAt(pc.angle)).map(_.source).collect {
-            case t: AngleSource.Title => t
-          }
-        val prod: Producer | Null = titleAngle match
-          case Some(t) =>
-            val lt   = LowerThird(s"mc-${pc.id}", t.name, t.title, 0, math.max(1, pc.length - 1),
-              styleId = t.styleId, body = t.body)
-            val card = Producer(profile, CardRenderer.renderCard(lt, project.styleFor(t.styleId), profile.width, profile.height))
+        // A card placement draws a full-frame lower third instead of a bin clip: a multicam title cut
+        // (`mc` resolving to a Title angle — a hard cut, no fade) or a title placed on this track
+        // (`titleId` naming a lower third, faded in and out over its own window). Either way a title cut
+        // is treated as a video clip and `clipId` is unused; every other placement (an ordinary clip, or
+        // a multicam clip-angle cut, whose source id and in-point are already on the placement) is its
+        // bin source.
+        val mcTitle = pc.mc.flatMap(project.mcFor).flatMap(_.angleAt(pc.angle)).map(_.source).collect {
+          case t: AngleSource.Title => LowerThird(s"mc-${pc.id}", t.name, t.title, styleId = t.styleId, body = t.body)
+        }
+        val titleCard: Option[(LowerThird, Boolean)] = // (content, whether it fades over its window)
+          mcTitle.map(lt => (lt, false)).orElse(pc.titleId.flatMap(project.titleFor).map(lt => (lt, true)))
+        val prod: Producer | Null = titleCard match
+          case Some((lt, _)) =>
+            val card = Producer(profile, CardRenderer.renderCard(lt, project.styleFor(lt.styleId), profile.width, profile.height))
             cardProds += card
             card
           case None =>
@@ -593,6 +595,19 @@ object Player:
             if track.kind == MediaKind.Audio then p.setInt("video_index", -1)
             else p.setInt("audio_index", -1)
             p.setInAndOut(pc.inPoint, pc.inPoint + pc.length - 1)
+            // A title placement fades in and out over its own window, its alpha keyed in the producer's
+            // *local* frame coordinates (0 … length-1): the card is a playlist entry, so a filter attached
+            // to it animates against the entry's own frames, not the whole tractor's. The card sits above
+            // the footage on a video track and composites over it (its transparent areas show the tracks
+            // below), so the same animation both fades the title and defines when it shows.
+            titleCard match
+              case Some((lt, true)) =>
+                val f    = math.max(1, math.min(lt.fadeFrames, (pc.length - 1) / 2))
+                val fade = Filter(profile, "brightness")
+                fade.set("alpha", s"0=0;$f=1;${pc.length - 1 - f}=1;${pc.length - 1}=0")
+                p.attach(fade)
+                filters += fade
+              case _ => ()
             pl.append(p)
             cursor = pc.timelineEnd
           case null => ()
@@ -645,25 +660,6 @@ object Player:
       playlists += pl
       tractor.setTrack(pl, slot)
       layers += Layer(slot, null, mixer())
-
-    // Lower thirds: a still card composited onto the base, faded by its own alpha. The fade rides the
-    // card's alpha, not the composite's mix — a brightness filter ramps transparency in over the fade,
-    // holds it opaque, ramps it out, and holds it fully transparent outside the window, so the same
-    // animation both fades the card and defines when it shows. MLT interpolates the property animation
-    // smoothly; the always-active composite's mix does not (the card would pop in at full opacity).
-    for lt0 <- project.lowerThirds do
-      val lt       = clampLt(lt0, length)
-      val slot     = nextTrack; nextTrack += 1
-      val cardPath = CardRenderer.renderCard(lt, project.styleFor(lt.styleId), profile.width, profile.height)
-      val card     = Producer(profile, cardPath)
-      card.setInAndOut(0, length - 1) // stretch the still card across the whole timeline
-      val fade = Filter(profile, "brightness")
-      fade.set("alpha", alphaFade(lt))
-      card.attach(fade)
-      tractor.setTrack(card, slot)
-      filters += fade
-      cardProds += card
-      layers += Layer(slot, composite(), null)
 
     // Every layer composites/mixes directly onto the base (track 0), never chained through the track
     // beneath it. Chaining breaks for still-image overlays: a still's position never advances, so a
@@ -866,30 +862,6 @@ object Player:
     built2.close()
     profile.close()
     res
-
-  /** Clamp a lower third's window to the timeline: its in-point stays on the timeline with room for
-    * the smallest possible card after it, and its out-point stays past the in-point and on the
-    * timeline. A window a caller gave in profile frames that overruns a short timeline is pulled in
-    * rather than rejected. */
-  private def clampLt(lt: LowerThird, length: Int): LowerThird =
-    val in  = math.max(0, math.min(lt.inFrame, length - 2))
-    val out = math.max(in + 2, math.min(lt.outFrame, length - 1))
-    lt.copy(inFrame = in, outFrame = out)
-
-  /** The alpha animation that fades a card in and out and hides it outside its window. The values are
-    * the card's alpha (0 fully transparent … 1 fully opaque) at absolute timeline frames — the
-    * brightness filter carrying this rides the still card, whose position is the timeline frame. It
-    * ramps 0→1 over the fade at the in-point, holds opaque, ramps back to 0 at the out-point, and stays
-    * transparent before and after (MLT holds the nearest keyframe outside the animation's range). MLT's
-    * property animation interpolates between the keyframes, which is what makes the fade smooth. */
-  private def alphaFade(lt: LowerThird): String =
-    val f = lt.fade
-    Seq(
-      s"${lt.inFrame}=0",
-      s"${lt.inFrame + f}=1",
-      s"${lt.outFrame - f}=1",
-      s"${lt.outFrame}=0",
-    ).mkString(";")
 
   /** Collapse MLT's colorspace tag to the three suit fixes a video texture is created with. The SD
     * family (601/470/170/240) shares coefficients, so it all maps to BT601; HD is BT709, which is

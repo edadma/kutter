@@ -16,10 +16,12 @@ import zio.json.*
 // along the timeline. Importing a clip is not the same as putting it on the timeline; a bin clip can
 // be placed on several tracks, or several times on one track, each placement its own in/out window.
 //
-// A lower third is split into the three things that were conflated when it was hardcoded: its
-// **content** (the words), its **placement** (when it shows and how it fades), and its **style** (the
-// look, chosen from a set of reusable presets rather than baked into the renderer). Lower thirds ride
-// on top of the whole track stack — kutter's reason for being is the automated typeset lower thirds.
+// A lower third is split into the things that were conflated when it was hardcoded: its **content**
+// (the words), its **style** (the look, chosen from a set of reusable presets rather than baked into
+// the renderer), and — like any other clip — its **placement** on the timeline. A lower third lives in
+// the project as reusable content (a title library); it is put on screen by placing it on a video track
+// (a `PlacedClip` carrying its `titleId`), where it composites over the tracks below and fades in and
+// out over its placement's window. Automated typeset lower thirds are kutter's reason for being.
 
 /** A colour, components in 0..1 — the wire form styles are written in. */
 final case class Rgba(r: Double, g: Double, b: Double, a: Double = 1.0)
@@ -150,7 +152,10 @@ object Style:
   /** The styles a new project starts with. */
   val presets: List[Style] = List(broadcastBlue, boldBar, minimal, texishCard)
 
-/** One lower third: its words, its window on the timeline, and the style it wears.
+/** One lower third's reusable content: its words, how long it fades, and the style it wears. It carries
+  * no timeline window — a lower third is placed on a video track like any clip (a [[PlacedClip]] with
+  * this title's id), and that placement owns when it shows and for how long; the fade length here is
+  * applied within whatever window the placement gives it.
   *
   * `body` is an escape hatch: a raw texish document for this one card, which overrides whatever the
   * style would have drawn (see `CardRenderer`). The words are still available to it as the `ltname` and
@@ -161,15 +166,11 @@ final case class LowerThird(
     id:         String,
     name:       String,
     title:      String,
-    inFrame:    Int,
-    outFrame:   Int,
     fadeFrames: Int            = 12,
     styleId:    String         = "broadcast-blue",
     body:       Option[String] = None, // a raw texish document for just this card, overriding its style
     source:     Option[String] = None, // the .klt file this was imported from, so a re-import replaces it
-):
-  /** The fade length, clamped so the in and out fades never overlap. */
-  def fade: Int = math.max(1, math.min(fadeFrames, (outFrame - inFrame) / 2))
+)
 
 object LowerThird:
   given JsonCodec[LowerThird] = DeriveJsonCodec.gen
@@ -214,7 +215,12 @@ object MediaClip:
   * cuts on one video track is the switched program picture; the group's audio bed plays continuously from
   * a separate audio placement. When `angle` resolves to a title angle, the cut draws that angle's card
   * full-frame — a title cut is a video clip like any other (see `Player.buildGraph`), and `clipId` is
-  * unused. An ordinary placement has `mc = None`. */
+  * unused. An ordinary placement has `mc = None`.
+  *
+  * `titleId` marks a placement as a lower third put on a video track: it names the [[LowerThird]] whose
+  * card the placement draws (full-frame, faded in and out over its window), and `clipId` is unused. This
+  * is how a title reaches the screen — it composites over the tracks below through its transparent areas.
+  * An ordinary placement has `titleId = None`. */
 final case class PlacedClip(
     id:            String,
     clipId:        String,
@@ -224,6 +230,7 @@ final case class PlacedClip(
     link:          Option[String] = None,
     mc:            Option[String] = None,
     angle:         Int            = 0,
+    titleId:       Option[String] = None,
 ):
   /** The frame just past this placement's end on the timeline. */
   def timelineEnd: Int = timelineStart + length
@@ -234,6 +241,11 @@ object PlacedClip:
   /** A placement of `clip` at `start`, playing the whole source for `length` frames from its head. */
   def make(clipId: String, start: Int, length: Int, inPoint: Int = 0, link: Option[String] = None): PlacedClip =
     PlacedClip(s"pc-${System.nanoTime()}", clipId, start, inPoint, length, link)
+
+  /** A placement of the lower third `titleId` at `start`, drawing its card for `length` frames. A title
+    * placement has no bin source (`clipId` empty) and plays from frame 0. */
+  def makeTitle(titleId: String, start: Int, length: Int): PlacedClip =
+    PlacedClip(s"pc-${System.nanoTime()}", "", start, 0, length, titleId = Some(titleId))
 
 /** A track container: a named lane that always exists and sequences a list of placed clips along the
   * timeline. Video tracks are composited top-down (higher tracks over lower); audio tracks are mixed.
@@ -373,6 +385,9 @@ final case class Project(
 
   /** The multicam group with `id`, if it is still in the project. */
   def mcFor(id: String): Option[Multicam] = multicams.find(_.id == id)
+
+  /** The lower third (title content) with `id`, if it is still in the project. */
+  def titleFor(id: String): Option[LowerThird] = lowerThirds.find(_.id == id)
 
   /** Replace the track with `id` through `f`, leaving the rest untouched. */
   def updateTrack(id: String)(f: Track => Track): Project =

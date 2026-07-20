@@ -30,6 +30,12 @@ import io.github.edadma.hocon.*
   */
 object BatchImport:
 
+  /** One imported title: its reusable content (`lt`) plus where the import places it on the timeline
+    * (`start` for `length` frames). A batch row gives both — the words and style become the content, the
+    * `in`/`out` times become the placement — so the importer can add the content to the project's title
+    * library and land a placement of it at the authored time in one step. */
+  final case class BatchTitle(lt: LowerThird, start: Int, length: Int)
+
   /** Parse a time written as a timecode (`h:mm:ss`, `m:ss`, `m:ss.cc`) or as seconds (`3`, `3.5`,
     * `3.5s`) into a number of seconds, or an error describing what didn't parse. */
   def parseTime(text: String): Either[String, Double] =
@@ -53,22 +59,23 @@ object BatchImport:
         case Some(s) if s >= 0 => Right(s)
         case _                 => Left(s"not a time: '$text'")
 
-  /** Parse `text` into lower thirds, converting each in/out to frames at `fps` and defaulting a row's
-    * missing style to `defaultStyle`. Returns the built overlays, or the first error found. */
-  def parse(text: String, fps: Double, defaultStyle: String): Either[String, List[LowerThird]] =
+  /** Parse `text` into titles, converting each in/out to a placement in frames at `fps` and defaulting a
+    * row's missing style to `defaultStyle`. Returns the built titles (content plus placement), or the
+    * first error found. */
+  def parse(text: String, fps: Double, defaultStyle: String): Either[String, List[BatchTitle]] =
     try
       val cfg = Hocon.parse(text)
       if !cfg.hasPath("lowerThirds") then Left("no `lowerThirds` list in the file")
       else
         val rows = cfg.getList("lowerThirds").zipWithIndex.map {
-          case (o: ConfigObject, i) => rowToLt(Config(o), i, fps, defaultStyle)
+          case (o: ConfigObject, i) => rowToTitle(Config(o), i, fps, defaultStyle)
           case (_, i)               => Left(s"lowerThirds[$i] is not an object")
         }
         sequence(rows)
     catch case e: Exception => Left(if e.getMessage != null then e.getMessage else e.toString)
 
-  // One array element → one `LowerThird`, or an error naming the row.
-  private def rowToLt(c: Config, index: Int, fps: Double, defaultStyle: String): Either[String, LowerThird] =
+  // One array element → one `BatchTitle` (content + placement), or an error naming the row.
+  private def rowToTitle(c: Config, index: Int, fps: Double, defaultStyle: String): Either[String, BatchTitle] =
     def required(name: String): Either[String, String] =
       c.getStringOpt(name).toRight(s"lowerThirds[$index]: missing `$name`")
     for
@@ -85,18 +92,17 @@ object BatchImport:
         id       = c.getStringOpt("id").getOrElse(s"batch-${System.nanoTime()}-$index"),
         name     = name,
         title    = c.getStringOpt("title").getOrElse(""),
-        inFrame  = inFrame,
-        outFrame = outFrame,
         styleId  = c.getStringOpt("style").getOrElse(defaultStyle),
         // A `body` is a raw texish document for this one card (a HOCON triple-quoted string), overriding
         // its style's look; omitted, the style draws the card.
         body     = c.getStringOpt("body"),
       )
       // Only override the model's fade default when the row states one.
-      c.getIntOpt("fade").map(f => base.copy(fadeFrames = f)).getOrElse(base)
+      val lt = c.getIntOpt("fade").map(f => base.copy(fadeFrames = f)).getOrElse(base)
+      BatchTitle(lt, inFrame, outFrame - inFrame)
 
-  // Collapse a list of per-row results into one: all the overlays, or the first error.
-  private def sequence(rows: List[Either[String, LowerThird]]): Either[String, List[LowerThird]] =
-    rows.foldRight[Either[String, List[LowerThird]]](Right(Nil)) { (row, acc) =>
-      for lt <- row; rest <- acc yield lt :: rest
+  // Collapse a list of per-row results into one: all the titles, or the first error.
+  private def sequence(rows: List[Either[String, BatchTitle]]): Either[String, List[BatchTitle]] =
+    rows.foldRight[Either[String, List[BatchTitle]]](Right(Nil)) { (row, acc) =>
+      for t <- row; rest <- acc yield t :: rest
     }

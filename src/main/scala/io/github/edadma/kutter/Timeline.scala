@@ -7,8 +7,8 @@ import io.github.edadma.suit.*
 // a scroll view so a tall stack scrolls while the ruler stays put. This object holds the shared
 // geometry and the per-widget painters; each track paints its own clips and its own segment of the
 // playhead, and because every widget shares the same width and time mapping the segments line up into
-// one continuous playhead. The base video track plus, in time, the overlay tracks the lower thirds
-// ride on are just more entries in that stack.
+// one continuous playhead. A lower third is not a lane of its own — it is placed on a video track like a
+// clip and draws as a tinted title block among that track's clips.
 object Timeline:
 
   val RulerHeight = 22.0 // the time-ruler widget's height
@@ -27,17 +27,6 @@ object Timeline:
     * out. See where `total` is computed in `App`. */
   val TimelineTailFrames = 1800
 
-  /** One lower third's block on the titles lane: its window on the timeline, a caption, the colour it
-    * wears (drawn from its style), and whether it is the selected one. */
-  case class OverlayBlock(
-      id:       String,
-      inFrame:  Int,
-      outFrame: Int,
-      label:    String,
-      color:    Color,
-      selected: Boolean,
-  )
-
   /** Which edge of a clip block a trim drags: the left edge (moving the in-point and the start together)
     * or the right edge (moving the out-point, i.e. the length). */
   enum TrimEdge:
@@ -54,25 +43,25 @@ object Timeline:
     * one-to-one block mapping. The block's geometry is the live placement, so a clip drawn here always
     * sits where the project puts it. */
   case class ClipBlock(
-      id:       String,
-      start:    Int,
-      length:   Int,
-      label:    String,
-      linked:   Boolean,
-      selected: Boolean,
-      inPoint:  Int              = 0,
-      srcLen:   Int              = 0,
-      thumbs:   Thumbnails | Null = null,
-      waveform: Waveform | Null   = null,
+      id:         String,
+      start:      Int,
+      length:     Int,
+      label:      String,
+      linked:     Boolean,
+      selected:   Boolean,
+      inPoint:    Int              = 0,
+      srcLen:     Int              = 0,
+      thumbs:     Thumbnails | Null = null,
+      waveform:   Waveform | Null   = null,
+      titleColor: Color | Null      = null, // a lower-third placement: draw a flat block in this tint, not a filmstrip/waveform
   )
 
-  /** One track: a named lane and what rides on it. A media track sequences its placed `clips` at their
-    * timeline positions (each a filmstrip or a waveform); the titles lane carries a set of lower-third
-    * `overlays` instead. A track sets whichever one it draws. */
+  /** One track: a named lane sequencing its placed `clips` at their timeline positions — each a
+    * filmstrip (a video clip), a waveform (an audio clip), or a flat tinted block (a lower-third title
+    * placed on a video track). */
   case class Track(
-      name:     String,
-      clips:    Seq[ClipBlock]          = Nil,
-      overlays: Seq[OverlayBlock] | Null = null,
+      name:  String,
+      clips: Seq[ClipBlock] = Nil,
   )
 
   /** The timeline viewport: which frame sits at the widget's left edge (`start`, fractional so a
@@ -93,12 +82,6 @@ object Timeline:
   def frameAt(px: Double, total: Int, view: View): Int =
     val f = math.round(view.frameAtPx(px)).toInt
     math.max(0, math.min(total - 1, f))
-
-  /** Where a dragged title block's in-frame lands: its `origIn` shifted by the drag's (already
-    * snapped) `delta`, clamped so the whole block (length `len`) stays within `[0, total)`. Keeps the
-    * block's length and never lets it run off either end. */
-  def dragPlacement(origIn: Int, len: Int, delta: Int, total: Int): Int =
-    math.max(0, math.min(total - 1 - len, origIn + delta))
 
   /** The magnet's reach: a fixed 8 screen pixels expressed as frames under the view's scale — how
     * close a dragged edge must come to an edit point before it sticks — and at least one frame, so
@@ -122,14 +105,6 @@ object Timeline:
   def snapEdgeDelta(delta: Int, origEdge: Int, targets: Seq[Int], reach: Int): Int =
     val pos = origEdge + delta
     delta + targets.iterator.map(t => t - pos).filter(f => math.abs(f) <= reach).minByOption(math.abs).getOrElse(0)
-
-  /** The id of the topmost overlay block under widget-local x `px`, if any — how a click on the titles
-    * lane picks a lower third. Blocks are tested back-to-front so the one drawn on top wins when two
-    * windows overlap. */
-  def overlayAt(px: Double, view: View, blocks: Seq[OverlayBlock]): Option[String] =
-    blocks.reverseIterator
-      .find(b => px >= view.xOf(b.inFrame) && px <= view.xOf(b.outFrame))
-      .map(_.id)
 
   /** The id of the clip block under widget-local x `px`, if any — how a press on a media lane picks a
     * placed clip to select or drag. Clips on a track never overlap, so the first hit wins. */
@@ -210,57 +185,70 @@ object Timeline:
     val room   = math.min(nextA, nextB) - start
     (start, math.min(srcLen, room))
 
-  /** The project after dropping the bin clip `clipId` onto the track `trackId` at timeline frame `frame`,
-    * `srcLen` frames of source available. This is what a drag from the bin resolves to. A **video** clip
-    * dropped on a **video** track lands as a linked A/V pair — its picture on that track and its sound on
-    * the first audio track, at one start both can hold (so they read and move as one); with no audio track
-    * it is the picture alone. An **audio** clip on an **audio** track lands there. A mismatch (an audio clip
-    * on a video track, say) or a drop with no room returns the project unchanged (the same reference), so a
-    * caller can tell nothing happened. The landing point and length come from [[freePlacement]], so a drop
-    * into a gap fills it and a drop onto a clip snaps past it — the same math the drop-preview ghost uses. */
-  def dropClip(project: Project, clipId: String, trackId: String, frame: Int, srcLen: Int): Project =
-    (project.clipFor(clipId), project.tracks.find(_.id == trackId)) match
-      case (Some(clip), Some(pt)) =>
-        // `pt`/`at` are project tracks (inferred, so the nested `Timeline.Track` name doesn't shadow the
-        // project `Track` here); this reads a track's placements as the (start, length) pairs freePlacement
-        // wants, and lands one placement on a single track.
-        def blocksOf(clips: List[PlacedClip]): Seq[(Int, Int)] = clips.map(c => (c.timelineStart, c.length))
-        def onOne(track: Project => (String, List[PlacedClip])): Project =
-          val (tid, clips)    = track(project)
-          val (start, length) = freePlacement(frame, srcLen, blocksOf(clips), Nil)
-          if length <= 0 then project
-          else project.updateTrack(tid)(x => x.copy(clips = x.clips :+ PlacedClip.make(clipId, start, length)))
-        (clip.kind, pt.kind) match
-          case (MediaKind.Video, MediaKind.Video) =>
-            // Pair the picture with the audio track that shares this video track's number — V2's sound goes
-            // to A2, V3's to A3 — created if it does not exist yet, so each camera's sound lands on its own
-            // lane, aligned under its picture. (Always sending it to A1 was the bug: a second camera on V2
-            // collided with the first camera's audio there, and when A1 was full at the drop point the
-            // placement had no room and silently did nothing.)
-            val (withAt, at) = pt.num.flatMap(n => project.audioTracks.find(_.num.contains(n))) match
-              case Some(a) => (project, a)
-              case None =>
-                val an = pt.num.getOrElse(project.tracks.flatMap(_.num).maxOption.getOrElse(0) + 1)
-                // The project `Track`, fully qualified — inside `object Timeline` the bare name is the
-                // nested block model, not the project track.
-                val na = io.github.edadma.kutter.Track(s"trk-${System.nanoTime()}", s"A$an", MediaKind.Audio)
-                (project.copy(tracks = project.tracks :+ na), na)
-            val (start, length) = freePlacement(frame, srcLen, blocksOf(pt.clips), blocksOf(at.clips))
+  /** The project after dropping the payload `payloadId` — a bin clip *or* a lower third (title) — onto
+    * the track `trackId` at timeline frame `frame`, `srcLen` frames available (a clip's source length, or
+    * the default length to give a title, which has no intrinsic length). This is what a drag from the bin
+    * resolves to.
+    *
+    *   - a **video** clip dropped on a **video** track lands as a linked A/V pair — its picture on that
+    *     track and its sound on the audio track sharing that video track's number (created if absent), at
+    *     one start both can hold (so they read and move as one);
+    *   - an **audio** clip on an **audio** track lands there;
+    *   - a **title** on a **video** track lands as a `titleId` placement, drawing its card over the tracks
+    *     below.
+    *
+    * Any other pairing (an audio clip on a video track, a title on an audio track), or a drop with no
+    * room, returns the project unchanged (the same reference), so a caller can tell nothing happened. The
+    * landing point and length come from [[freePlacement]], so a drop into a gap fills it and a drop onto a
+    * clip snaps past it — the same math the drop-preview ghost uses. */
+  def dropClip(project: Project, payloadId: String, trackId: String, frame: Int, srcLen: Int): Project =
+    def blocksOf(clips: List[PlacedClip]): Seq[(Int, Int)] = clips.map(c => (c.timelineStart, c.length))
+    project.tracks.find(_.id == trackId) match
+      case None => project
+      case Some(pt) => project.titleFor(payloadId) match
+        // A title placed on a video track: a `titleId` placement across a default-length window, snapped
+        // into a gap like any clip. A title dropped on an audio track is rejected.
+        case Some(_) =>
+          if pt.kind != MediaKind.Video then project
+          else
+            val (start, length) = freePlacement(frame, srcLen, blocksOf(pt.clips), Nil)
             if length <= 0 then project
-            else
-              val link = Some(s"lnk-${System.nanoTime()}")
-              withAt.copy(tracks = withAt.tracks.map(t =>
-                if t.id == pt.id || t.id == at.id then t.copy(clips = t.clips :+ PlacedClip.make(clipId, start, length, link = link))
-                else t))
-          case (MediaKind.Audio, MediaKind.Audio) => onOne(_ => (pt.id, pt.clips))
-          case _                                  => project // an incompatible clip/track pairing: no drop
-      case _ => project
+            else project.updateTrack(pt.id)(x => x.copy(clips = x.clips :+ PlacedClip.makeTitle(payloadId, start, length)))
+        case None => project.clipFor(payloadId) match
+          case None => project
+          case Some(clip) =>
+            // `pt`/`at` are project tracks; land one placement on a single track (audio here).
+            def onOne(track: Project => (String, List[PlacedClip])): Project =
+              val (tid, clips)    = track(project)
+              val (start, length) = freePlacement(frame, srcLen, blocksOf(clips), Nil)
+              if length <= 0 then project
+              else project.updateTrack(tid)(x => x.copy(clips = x.clips :+ PlacedClip.make(payloadId, start, length)))
+            (clip.kind, pt.kind) match
+              case (MediaKind.Video, MediaKind.Video) =>
+                // Pair the picture with the audio track that shares this video track's number — V2's sound
+                // goes to A2, V3's to A3 — created if it does not exist yet, so each camera's sound lands on
+                // its own lane, aligned under its picture. (Always sending it to A1 was the bug: a second
+                // camera on V2 collided with the first camera's audio there, and when A1 was full at the
+                // drop point the placement had no room and silently did nothing.)
+                val (withAt, at) = pt.num.flatMap(n => project.audioTracks.find(_.num.contains(n))) match
+                  case Some(a) => (project, a)
+                  case None =>
+                    val an = pt.num.getOrElse(project.tracks.flatMap(_.num).maxOption.getOrElse(0) + 1)
+                    // The project `Track`, fully qualified — inside `object Timeline` the bare name is the
+                    // nested block model, not the project track.
+                    val na = io.github.edadma.kutter.Track(s"trk-${System.nanoTime()}", s"A$an", MediaKind.Audio)
+                    (project.copy(tracks = project.tracks :+ na), na)
+                val (start, length) = freePlacement(frame, srcLen, blocksOf(pt.clips), blocksOf(at.clips))
+                if length <= 0 then project
+                else
+                  val link = Some(s"lnk-${System.nanoTime()}")
+                  withAt.copy(tracks = withAt.tracks.map(t =>
+                    if t.id == pt.id || t.id == at.id then t.copy(clips = t.clips :+ PlacedClip.make(payloadId, start, length, link = link))
+                    else t))
+              case (MediaKind.Audio, MediaKind.Audio) => onOne(_ => (pt.id, pt.clips))
+              case _                                  => project // an incompatible clip/track pairing: no drop
 
   private def playheadInk(theme: Theme): Color = theme.accent
-
-  /** A readable ink for a caption over `bg`: black on a light block, white on a dark one. */
-  private def readableInk(bg: Color): Color =
-    if 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b > 150 then Color.black else Color.white
 
   /** Paint the ruler widget: a faint band with a tick and a centred m:ss label at a spacing that
     * stays uncrowded at the view's scale, covering only the seconds the view shows, plus the
@@ -309,14 +297,6 @@ object Timeline:
     val radius   = BorderRadius.all(6)
     cv.fillRect(Rect(0, 0, w, h), laneBg)
 
-    // The titles lane paints lower-third blocks instead of clips and returns early.
-    val overlays = track.overlays
-    if overlays != null then
-      paintOverlays(cv, overlays, view, w, bh, theme)
-      val hx = view.xOf(position)
-      cv.fillRect(Rect(hx - 0.5, 0, 1.5, h), playheadInk(theme))
-      return
-
     val audioBg = if theme.isDark then Color.rgb(0x24303a) else Color.rgb(0xd4e2ee)
     val waveInk = if theme.isDark then Color.rgb(0x74c0fc) else Color.rgb(0x3b7bb8)
 
@@ -347,44 +327,50 @@ object Timeline:
       def srcFrac(blockFrac: Double): Double =
         if b.srcLen > 0 then (b.inPoint + blockFrac * b.length) / b.srcLen else blockFrac
 
-      b.waveform match
-        case wf: Waveform =>
-          // An audio clip: the peak envelope mirrored around the block's midline.
-          cv.fillRoundedRect(r, radius, audioBg)
-          cv.pushClip(r, radius)
-          val mid   = 2 + bh / 2
-          val halfH = (bh / 2) * 0.88
-          cv.fillRect(Rect(x1 + 1, mid - 0.25, bw, 0.5), waveInk) // centre line
-          // Only the visible slice of the envelope is sampled — a long clip mostly off-screen
-          // costs what its on-screen pixels cost, not its full width.
-          var sx = math.max(x1 + 1, 0.0)
-          val ex = math.min(x2 - 1, w)
-          while sx < ex do
-            val hh = wf.at(srcFrac((sx - x1) / span)) * halfH
-            if hh > 0.3 then cv.fillRect(Rect(sx, mid - hh, 1.3, hh * 2), waveInk)
-            sx += 1.6
-          cv.popClip()
-
-        case null =>
-          // A video clip: a filmstrip where the strip is ready, flat otherwise, with a bright cap.
-          b.thumbs match
-            case t: Thumbnails =>
-              cv.fillRoundedRect(r, radius, blockCol)
-              cv.pushClip(r, radius)
-              val tw = math.max(8.0, bh * 16.0 / 9.0)
-              // Start at the first tile that reaches the view and stop past its right edge, so an
-              // off-screen stretch of filmstrip draws nothing.
-              var sx = x1 + 1 + math.max(0.0, math.floor((-(x1 + 1) - tw) / tw) + 1) * tw
-              val ex = math.min(x2 - 1, w + tw)
-              while sx < ex do
-                t.at(srcFrac((sx - x1) / span)) match
-                  case img: RasterImage => cv.drawImage(img, Rect(sx, 2, tw, bh))
-                  case null             => ()
-                sx += tw
-              cv.popClip()
-            case null =>
-              cv.fillRoundedRect(r, radius, blockCol)
+      b.titleColor match
+        // A lower-third title placed on a video track: a flat block in the title's tint (no filmstrip or
+        // waveform — a still card has neither), with the same bright cap the video clips carry.
+        case tint: Color =>
+          cv.fillRoundedRect(r, radius, tint)
           cv.fillRoundedRect(Rect(x1 + 1, 2, bw, 4), BorderRadius.all(2), blockTop)
+        case null => b.waveform match
+          case wf: Waveform =>
+            // An audio clip: the peak envelope mirrored around the block's midline.
+            cv.fillRoundedRect(r, radius, audioBg)
+            cv.pushClip(r, radius)
+            val mid   = 2 + bh / 2
+            val halfH = (bh / 2) * 0.88
+            cv.fillRect(Rect(x1 + 1, mid - 0.25, bw, 0.5), waveInk) // centre line
+            // Only the visible slice of the envelope is sampled — a long clip mostly off-screen
+            // costs what its on-screen pixels cost, not its full width.
+            var sx = math.max(x1 + 1, 0.0)
+            val ex = math.min(x2 - 1, w)
+            while sx < ex do
+              val hh = wf.at(srcFrac((sx - x1) / span)) * halfH
+              if hh > 0.3 then cv.fillRect(Rect(sx, mid - hh, 1.3, hh * 2), waveInk)
+              sx += 1.6
+            cv.popClip()
+
+          case null =>
+            // A video clip: a filmstrip where the strip is ready, flat otherwise, with a bright cap.
+            b.thumbs match
+              case t: Thumbnails =>
+                cv.fillRoundedRect(r, radius, blockCol)
+                cv.pushClip(r, radius)
+                val tw = math.max(8.0, bh * 16.0 / 9.0)
+                // Start at the first tile that reaches the view and stop past its right edge, so an
+                // off-screen stretch of filmstrip draws nothing.
+                var sx = x1 + 1 + math.max(0.0, math.floor((-(x1 + 1) - tw) / tw) + 1) * tw
+                val ex = math.min(x2 - 1, w + tw)
+                while sx < ex do
+                  t.at(srcFrac((sx - x1) / span)) match
+                    case img: RasterImage => cv.drawImage(img, Rect(sx, 2, tw, bh))
+                    case null             => ()
+                  sx += tw
+                cv.popClip()
+              case null =>
+                cv.fillRoundedRect(r, radius, blockCol)
+            cv.fillRoundedRect(Rect(x1 + 1, 2, bw, 4), BorderRadius.all(2), blockTop)
 
       // The clip's name, over a soft scrim so it reads on either a filmstrip or a waveform.
       val label = b.label
@@ -398,34 +384,6 @@ object Timeline:
 
       // A link pip marks a clip that moves with its A/V partner (the picture and its sound stay locked).
       if b.linked then cv.fillRoundedRect(Rect(x2 - 9, 4, 5, 5), BorderRadius.all(2.5), theme.accent)
-
-      if b.selected then cv.strokeRoundedRect(r, radius, theme.primary, 2.0)
-      else cv.strokeRoundedRect(r, radius, theme.border, 1.0)
-
-  /** Paint the titles lane: each lower third as a rounded block across its in/out window, filled with
-    * its style's colour and captioned with its name. The selected block is ringed in the primary
-    * colour so it reads as the inspector's subject; the others carry a plain border. A block wholly
-    * outside the view is skipped. */
-  private def paintOverlays(
-      cv: Canvas, blocks: Seq[OverlayBlock], view: View, w: Double, bh: Double, theme: Theme,
-  ): Unit =
-    val radius = BorderRadius.all(6)
-    for b <- blocks if view.xOf(b.outFrame) >= 0 && view.xOf(b.inFrame) <= w do
-      val x1 = view.xOf(b.inFrame)
-      val x2 = view.xOf(b.outFrame)
-      val bw = math.max(2.0, x2 - x1 - 2)
-      val r  = Rect(x1 + 1, 2, bw, bh)
-      cv.fillRoundedRect(r, radius, b.color)
-
-      val ink   = readableInk(b.color)
-      val style = TextStyle(11.0, ink)
-      cv.pushClip(r, radius)
-      val pad   = 6.0
-      val label = b.label
-      val lw    = cv.measureText(label, style).width
-      if lw <= bw - pad * 2 || bw > 40 then
-        cv.drawText(Offset(x1 + 1 + pad, 2 + (bh - 11) / 2), label, style)
-      cv.popClip()
 
       if b.selected then cv.strokeRoundedRect(r, radius, theme.primary, 2.0)
       else cv.strokeRoundedRect(r, radius, theme.border, 1.0)

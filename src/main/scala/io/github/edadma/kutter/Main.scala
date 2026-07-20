@@ -264,7 +264,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // signature compile to the same graph, so a change that only moved a fader can be told apart from one
   // that needs a rebuild.
   def graphSig(p: Project): Any =
-    (p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart, pc.mc, pc.angle)))),
+    (p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart, pc.mc, pc.angle, pc.titleId)))),
      p.lowerThirds, p.multicams)
 
   val edited     = useRef(false)
@@ -337,9 +337,10 @@ private val App: Component[Session] = component[Session] { initial =>
         setPlaying(p.isPlaying)
       case null => ()
 
-  // The frame the project's content reaches — the furthest clip or lower third — which the timeline
-  // must be at least as long as so a clip dragged toward the end still has room and the ruler covers it.
-  val projectExtent = math.max(project.contentEnd, project.lowerThirds.map(_.outFrame + 1).maxOption.getOrElse(0))
+  // The frame the project's content reaches — the furthest placement on any track (a title placement
+  // among them) — which the timeline must be at least as long as so a clip dragged toward the end still
+  // has room and the ruler covers it.
+  val projectExtent = project.contentEnd
 
   // How far the project's content reaches, and the frame rate. With a project open this is the player's
   // graph length, grown to cover any edit made since it opened (a clip moved past the old end) so the
@@ -456,21 +457,23 @@ private val App: Component[Session] = component[Session] { initial =>
   def panel(flexN: Int = 0, h: Double = Double.NaN)(child: VNode): VNode =
     KutterUi.panel(theme)(flexN, h)(child)
 
-  // Add a lower third and select it for editing. It opens around the current playhead — a sensible
-  // default a user then tunes in the inspector — and starts on the first style. A lower third is
-  // project data and can be added at any time, footage or not.
+  // Add a lower third to the title library and select it for editing. It is unplaced content — words and
+  // a style, no timeline window — that reaches the screen only once dragged onto a video track. A lower
+  // third is project data and can be added at any time, footage or not.
   def addLowerThird(): Unit =
-    val id    = s"lt-${System.nanoTime()}"
-    val len   = math.min(90, math.max(1, total - 1))
-    val start = math.max(0, math.min(playheadRef.current, total - 1 - len))
-    val lt    = LowerThird(id, "Name", "Title", start, start + len)
+    val id = s"lt-${System.nanoTime()}"
+    val lt = LowerThird(id, "Name", "Title")
     editProject(p => p.copy(lowerThirds = p.lowerThirds :+ lt))
     setSelectedId(Some(id))
     setSelectedClipId(None)
 
-  // Remove a lower third, clearing the selection if it was the one removed.
+  // Remove a lower third from the library, taking any placements of it off the tracks, and clear the
+  // selection if it was the one removed.
   def removeLowerThird(id: String): Unit =
-    editProject(p => p.copy(lowerThirds = p.lowerThirds.filterNot(_.id == id)))
+    editProject(p => p.copy(
+      lowerThirds = p.lowerThirds.filterNot(_.id == id),
+      tracks = p.tracks.map(t => t.copy(clips = t.clips.filterNot(_.titleId.contains(id)))),
+    ))
     if selectedId.contains(id) then setSelectedId(None)
 
   // Tear down the player and its texture and drop the refs — shared by removing a clip and clearing the
@@ -716,7 +719,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // in-point, length, start) in order — so opening a project with the same media reuses the live
   // graph-swap and a different arrangement re-opens.
   def mediaKey(p: Project): Seq[Any] =
-    p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart, pc.mc, pc.angle))))
+    p.tracks.map(t => (t.kind, t.ordered.map(pc => (p.clipFor(pc.clipId).map(_.path), pc.inPoint, pc.length, pc.timelineStart, pc.mc, pc.angle, pc.titleId))))
 
   // Apply a project loaded from `loadedPath`: if it arranges the same media as the current project, the
   // live rebuild handles it (just swap the project state); otherwise everything the player built is tied
@@ -745,10 +748,13 @@ private val App: Component[Session] = component[Session] { initial =>
   val importFilter = Seq(FileDialog.Filter("Lower thirds", "klt"))
 
   // Import a `.klt` list of lower thirds: prompt for the file, parse it (times to frames at the current
-  // rate, a row's style defaulting to the project's first), tag each with the file it came from, and
-  // merge — a re-import of the SAME file replaces the lower thirds it produced before (edit the file,
-  // re-import, and the old set is swapped for the new) rather than piling duplicates up. The first
-  // imported overlay is selected; a parse error names the offending row and nothing changes.
+  // rate, a row's style defaulting to the project's first), and both add the titles to the library and
+  // land each as a placement at its authored time — the automation the batch importer exists for. The
+  // placements go on a dedicated titles video track above the footage (reused across re-imports, created
+  // if absent), so the cards composite over it. A re-import of the SAME file replaces the titles and
+  // placements it produced before (edit the file, re-import, and the old set is swapped for the new)
+  // rather than piling duplicates up. The first imported title is selected; a parse error names the
+  // offending row and nothing changes.
   def doImportLowerThirds(): Unit =
     FileDialog.open(filters = importFilter, title = "Import lower thirds") {
       case FileDialog.Result.Chosen(paths) =>
@@ -761,10 +767,31 @@ private val App: Component[Session] = component[Session] { initial =>
             finally src.close()
           catch case e: Exception => Left(if e.getMessage != null then e.getMessage else e.toString)
         result match
-          case Right(lts) =>
-            val tagged = lts.map(_.copy(source = Some(file)))
-            editProject(p => p.copy(lowerThirds = p.lowerThirds.filterNot(_.source.contains(file)) ++ tagged))
-            tagged.headOption.foreach(lt => setSelectedId(Some(lt.id)))
+          case Right(titles) =>
+            val tagged = titles.map(t => t.copy(lt = t.lt.copy(source = Some(file))))
+            editProject { p =>
+              val oldIds = p.lowerThirds.filter(_.source.contains(file)).map(_.id).toSet
+              // The track a previous import of this file used — found by its placements before they are
+              // cleared, so a re-import reuses the same lane rather than leaving an empty one behind.
+              val laneId = p.tracks.find(t => t.kind == MediaKind.Video && t.clips.exists(c => c.titleId.exists(oldIds.contains))).map(_.id)
+              val cleaned = p.copy(
+                lowerThirds = p.lowerThirds.filterNot(lt => oldIds.contains(lt.id)),
+                tracks = p.tracks.map(t => t.copy(clips = t.clips.filterNot(c => c.titleId.exists(oldIds.contains)))),
+              )
+              val (withTrack, laneTid) = laneId.flatMap(id => cleaned.tracks.find(_.id == id).map(_.id)) match
+                case Some(id) => (cleaned, id)
+                case None =>
+                  val n  = cleaned.tracks.flatMap(_.num).maxOption.getOrElse(0) + 1
+                  val nt = Track(s"trkt-${System.nanoTime()}", s"V$n", MediaKind.Video)
+                  val (vids, auds) = cleaned.tracks.partition(_.kind == MediaKind.Video)
+                  (cleaned.copy(tracks = (vids :+ nt) ++ auds), nt.id)
+              val placed = tagged.map(t => PlacedClip.makeTitle(t.lt.id, t.start, t.length))
+              withTrack.copy(
+                lowerThirds = withTrack.lowerThirds ++ tagged.map(_.lt),
+                tracks = withTrack.tracks.map(t => if t.id == laneTid then t.copy(clips = t.clips ++ placed) else t),
+              )
+            }
+            tagged.headOption.foreach(t => setSelectedId(Some(t.lt.id)))
           case Left(err) =>
             LoggerFactory.getLogger.error(s"could not import '$file': $err", category = "player")
       case _ => ()
@@ -917,9 +944,14 @@ private val App: Component[Session] = component[Session] { initial =>
   val selectedClip =
     selectedClipId.flatMap(id =>
       project.tracks.flatMap(_.clips).find(_.id == id).flatMap(pc => project.clipFor(pc.clipId).map((pc, _))))
-  val selectedLt     = selectedId.flatMap(id => project.lowerThirds.find(_.id == id))
+  // A title placement selected on a video track (its content resolved via `titleId`), and a title
+  // selected in the bin (unplaced content). Both feed the inspector's title editor.
+  val selectedTitle =
+    selectedClipId.flatMap(id =>
+      project.tracks.flatMap(_.clips).find(_.id == id).flatMap(pc => pc.titleId.flatMap(project.titleFor).map((pc, _))))
+  val selectedLt     = selectedId.flatMap(project.titleFor)
   val inspectorPanel =
-    InspectorPanel(InspectorProps(selectedClip, selectedLt, project.styles, fps, editLt, removePlacement, unlinkPlacement))
+    InspectorPanel(InspectorProps(selectedClip, selectedTitle, selectedLt, project.styles, fps, editLt, removePlacement, unlinkPlacement))
 
   // The audio mixer (a pane in the right column) — see [[MixerPanel]]. The master strip mirrors the
   // transport's volume control (same value, same handler), so the two stay in lockstep.
@@ -930,18 +962,25 @@ private val App: Component[Session] = component[Session] { initial =>
   // the live project and the timeline metrics it computes (length, fit span, frame rate), the current
   // selection, and the two shared refs it advances and reads — the playhead and the project player;
   // every edit funnels back through the callbacks. `resetToken` refits it to the whole timeline.
-  // Place a bin clip dragged onto a track at `frame`. The pure `Timeline.dropClip` resolves it — a video
-  // clip becomes a linked A/V pair (picture on the target video track, sound on the first audio track), an
-  // audio clip lands on the audio track, an incompatible pairing is a no-op (the same project reference
-  // back). Placing changes the lanes' generators, so a real change re-opens the player, as importing does.
-  def onDropClip(clipId: String, trackId: String, frame: Int): Unit =
-    project.clipFor(clipId).foreach { clip =>
-      val srcLen = math.max(1, if clip.frames > 0 then clip.frames else Player.mediaLength(clip.path, project.spec))
-      val np     = Timeline.dropClip(project, clipId, trackId, frame, srcLen)
-      if np ne project then
-        dirty.current = true
-        reopen(np, path)
-    }
+  // Place a bin payload dragged onto a track at `frame`. The pure `Timeline.dropClip` resolves it — a
+  // video clip becomes a linked A/V pair (picture on the target video track, sound on the paired audio
+  // track), an audio clip lands on the audio track, a title becomes a card placement on the video track,
+  // and an incompatible pairing is a no-op (the same project reference back). A clip changes the lanes'
+  // decoded generators, so it re-opens the player (as importing does); a title adds only a card generator,
+  // which the live graph-swap handles (as adding a lower third always did).
+  def onDropClip(payloadId: String, trackId: String, frame: Int): Unit =
+    project.titleFor(payloadId) match
+      case Some(_) =>
+        val np = Timeline.dropClip(project, payloadId, trackId, frame, math.max(1, (3 * fps).toInt))
+        if np ne project then editProject(_ => np)
+      case None =>
+        project.clipFor(payloadId).foreach { clip =>
+          val srcLen = math.max(1, if clip.frames > 0 then clip.frames else Player.mediaLength(clip.path, project.spec))
+          val np     = Timeline.dropClip(project, payloadId, trackId, frame, srcLen)
+          if np ne project then
+            dirty.current = true
+            reopen(np, path)
+        }
 
   // Add an empty video or audio track. A new video track joins the top of the video group (so it
   // composites over the others and draws highest); a new audio track joins the end of the audio group.
@@ -984,7 +1023,6 @@ private val App: Component[Session] = component[Session] { initial =>
     playheadRef         = playheadRef,
     playerRef           = playerRef,
     editProject         = editProject(_),
-    editLt              = editLt(_, _),
     setSelectedClipId   = setSelectedClipId,
     setSelectedLtId     = setSelectedId,
     focusProjectMonitor = () => focusProjectMonitor(),

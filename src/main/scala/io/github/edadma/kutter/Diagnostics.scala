@@ -3,7 +3,6 @@ package io.github.edadma.kutter
 import java.io.File
 
 import io.github.edadma.mlt.Mlt
-import io.github.edadma.suit.Color
 import scala.io.Source
 import zio.json.*
 
@@ -35,18 +34,27 @@ private[kutter] object Diagnostics:
       ),
     )
 
-  /** A demonstration project over `mediaPath`: the clip on V1 and three lower thirds in three different
-    * styles, so the compositing and the style presets are all visible. A stand-in that gives the probes
-    * overlays to exercise; the real app starts from a blank or remembered session instead. */
-  def demoProject(mediaPath: String): Project =
-    videoProject(mediaPath).copy(
-      name = "Demo",
-      lowerThirds = List(
-        LowerThird("lt1", "Big Buck Bunny", "kutter · automated lower thirds", 45, 165, styleId = "broadcast-blue"),
-        LowerThird("lt2", "Directed by", "the Blender Foundation", 230, 350, styleId = "bold-bar"),
-        LowerThird("lt3", "Typeset by", "the texish engine", 420, 540, styleId = "texish-card"),
-      ),
+  /** Add lower thirds to `p` as content plus placements on a dedicated top video track — the shape the
+    * app's importer produces (a titles lane above the footage). Each `(lt, start, length)` becomes one
+    * title placement; the content goes in the library and the placements on a fresh `VT` video track so
+    * the cards composite over the tracks below. For the probes that render placed titles. */
+  private def withTitles(p: Project, titles: List[(LowerThird, Int, Int)], trackId: String = "vt"): Project =
+    val placed = titles.map { case (lt, start, length) => PlacedClip.makeTitle(lt.id, start, length) }
+    p.copy(
+      lowerThirds = p.lowerThirds ++ titles.map(_._1),
+      tracks = p.tracks :+ Track(trackId, "VT", MediaKind.Video, placed),
     )
+
+  /** A demonstration project over `mediaPath`: the clip on V1 and three lower thirds in three different
+    * styles placed on a titles track over it, so the compositing and the style presets are all visible. A
+    * stand-in that gives the probes titles to exercise; the real app starts from a blank or remembered
+    * session instead. */
+  def demoProject(mediaPath: String): Project =
+    withTitles(videoProject(mediaPath).copy(name = "Demo"), List(
+      (LowerThird("lt1", "Big Buck Bunny", "kutter · automated lower thirds", styleId = "broadcast-blue"), 45, 120),
+      (LowerThird("lt2", "Directed by", "the Blender Foundation", styleId = "bold-bar"), 230, 120),
+      (LowerThird("lt3", "Typeset by", "the texish engine", styleId = "texish-card"), 420, 120),
+    ))
 
   // Load a rendered card PNG and report its pixel size and whether it is an alpha-capable ARGB32 image —
   // enough to confirm off the GUI that a texish card came out at the frame size and kept the overlay
@@ -72,8 +80,9 @@ private[kutter] object Diagnostics:
           val src = Source.fromFile(f)
           val txt = try src.mkString finally src.close()
           BatchImport.parse(txt, 30.0, ds) match
-            case Right(lts) => project.copy(lowerThirds = lts) // replace, so the render shows the imported set alone
-            case Left(err)  => println(s"probe import error: $err"); project
+            // Replace with the imported set alone, placed on a titles track over the project's footage.
+            case Right(titles) => withTitles(project.copy(lowerThirds = Nil), titles.map(t => (t.lt, t.start, t.length)))
+            case Left(err)     => println(s"probe import error: $err"); project
         }
         Mlt.init()
         Player.probe(proj, frame, "probe.png")
@@ -116,25 +125,28 @@ private[kutter] object Diagnostics:
               )),
             ))
           case "lt" =>
-            Project.blank.copy(bin = List(clip),
-              tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len)))),
-              lowerThirds = List(LowerThird("t", "Name", "Title", 0, math.max(1, len - 1))))
+            withTitles(
+              Project.blank.copy(bin = List(clip),
+                tracks = List(Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len))))),
+              List((LowerThird("t", "Name", "Title"), 0, math.max(1, len - 1))))
           case "full" =>
             // Mimic the project monitor: a video clip composited on V1, the tone mixed on A1, and three
             // lower-third card composites — the graph shape the interference appears in.
             val vsrc  = sys.env.getOrElse("KUTTER_AUDIO_VIDEO", "big_buck_bunny_720p.mp4")
             val vlen  = Player.mediaLength(vsrc, TimelineSpec.default)
             val vclip = MediaClip.make(vsrc, MediaKind.Video, vlen)
-            Project.blank.copy(
-              bin = List(clip, vclip),
-              tracks = List(
-                Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(vclip.id, 0, math.min(vlen, len)))),
-                Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len))),
+            withTitles(
+              Project.blank.copy(
+                bin = List(clip, vclip),
+                tracks = List(
+                  Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(vclip.id, 0, math.min(vlen, len)))),
+                  Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len))),
+                ),
               ),
-              lowerThirds = List(
-                LowerThird("t1", "One", "a", 0, len / 3),
-                LowerThird("t2", "Two", "b", len / 3, 2 * len / 3),
-                LowerThird("t3", "Three", "c", 2 * len / 3, math.max(1, len - 1)),
+              List(
+                (LowerThird("t1", "One", "a"), 0, len / 3),
+                (LowerThird("t2", "Two", "b"), len / 3, len / 3),
+                (LowerThird("t3", "Three", "c"), 2 * len / 3, math.max(1, len - 1 - 2 * len / 3)),
               ),
             )
           case _ =>
@@ -147,16 +159,13 @@ private[kutter] object Diagnostics:
       case None => ()
 
     // `KUTTER_PROBE_HIT` checks the timeline's pure click-mapping and drag math — `frameAt` (cursor x →
-    // frame), `overlayAt`/`clipAt` (cursor x → the lower third or clip under it), `dragPlacement` (a
-    // title's new window), and `clipStartBounds` (how far a placed clip may slide within its gap) —
-    // without a window, since selecting and moving a block on the timeline hang off exactly these. It
-    // prints PASS/FAIL per case and exits non-zero on any failure, a regression guard runnable off the GUI.
+    // frame), `clipAt` (cursor x → the clip under it), the snap magnetism, and `clipStartBounds` (how far
+    // a placed clip may slide within its gap) — without a window, since selecting and moving a block on
+    // the timeline hang off exactly these. It prints PASS/FAIL per case and exits non-zero on any failure,
+    // a regression guard runnable off the GUI.
     if sys.env.contains("KUTTER_PROBE_HIT") then
       val total = 600
       val view  = Timeline.View(0, 1.0) // a 1:1 frame-to-pixel view keeps the expected values obvious
-      val a     = Timeline.OverlayBlock("a", 45, 165, "A", Color.white, false)
-      val b     = Timeline.OverlayBlock("b", 230, 350, "B", Color.white, false)
-      val c     = Timeline.OverlayBlock("c", 100, 140, "C", Color.white, false) // overlaps a; drawn later
       var ok    = true
       def check(name: String, got: Any, want: Any): Unit =
         val pass = got == want
@@ -169,15 +178,6 @@ private[kutter] object Diagnostics:
       // A panned/zoomed view shifts and scales the same mapping: at 2px/frame starting from frame
       // 50, x=100 sits 50 frames past the view's start.
       check("frameAt panned", Timeline.frameAt(100.0, total, Timeline.View(50, 2.0)), 100)
-      check("overlayAt on a", Timeline.overlayAt(100.0, view, Seq(a, b)), Some("a"))
-      check("overlayAt on b", Timeline.overlayAt(300.0, view, Seq(a, b)), Some("b"))
-      check("overlayAt gap", Timeline.overlayAt(200.0, view, Seq(a, b)), None)
-      check("overlayAt topmost", Timeline.overlayAt(120.0, view, Seq(a, c)), Some("c"))
-      // dragPlacement: block in=45 out=165 (len 120), moved by a (snapped) delta and clamped.
-      check("drag right", Timeline.dragPlacement(45, 120, 50, total), 95)
-      check("drag left", Timeline.dragPlacement(45, 120, -40, total), 5)
-      check("drag clamp-left", Timeline.dragPlacement(45, 120, -100, total), 0)
-      check("drag clamp-right", Timeline.dragPlacement(45, 120, 9999, total), total - 1 - 120)
 
       // The drag magnetism. snapReach converts the fixed 8-pixel magnet to frames under the widget's
       // mapping (1:1 here → 8 frames, and never below 1 frame). snapDelta adjusts a sliding block's
@@ -249,11 +249,11 @@ private[kutter] object Diagnostics:
           |]""".stripMargin
       val imported = BatchImport.parse(list, 30.0, "broadcast-blue")
       check("import count", imported.map(_.size), Right(2))
-      check("import in-frame", imported.map(_.head.inFrame), Right(30))    // 1s @ 30fps
-      check("import out-frame", imported.map(_.head.outFrame), Right(90))  // 3s @ 30fps
-      check("import default style", imported.map(_.head.styleId), Right("broadcast-blue"))
-      check("import row-style", imported.map(_(1).styleId), Right("minimal"))
-      check("import row-fade", imported.map(_(1).fadeFrames), Right(5))
+      check("import start", imported.map(_.head.start), Right(30))                        // 1s @ 30fps
+      check("import length", imported.map(_.head.length), Right(60))                      // 3s − 1s @ 30fps
+      check("import default style", imported.map(_.head.lt.styleId), Right("broadcast-blue"))
+      check("import row-style", imported.map(_(1).lt.styleId), Right("minimal"))
+      check("import row-fade", imported.map(_(1).lt.fadeFrames), Right(5))
       check("import bad-order", BatchImport.parse("""lowerThirds=[{name=A,in=5,out=3}]""", 30.0, "x").isLeft, true)
 
       // Texish card: render the preset template to a temp PNG and confirm it comes out at the frame size
@@ -270,12 +270,12 @@ private[kutter] object Diagnostics:
       // keeps verbatim on the lower third.
       val tq       = "\"\"\""
       val bodyList = s"lowerThirds = [ { name = X, in = 0, out = 2, body = ${tq}raw body${tq} } ]"
-      check("import body", BatchImport.parse(bodyList, 30.0, "b").map(_.head.body), Right(Some("raw body")))
+      check("import body", BatchImport.parse(bodyList, 30.0, "b").map(_.head.lt.body), Right(Some("raw body")))
 
       // A card's own body overrides its style: even paired with a Cairo style (no template), renderCard
       // dispatches to texish and produces a valid transparent card.
       val bodyDoc  = """\use{document}\geometry margin:0\def footline {}\vfill\noindent{\color{white}\font lmroman 40 {sans bold}\the\ltname}"""
-      val bodyLt   = LowerThird("probe-body", "Custom", "", 0, 60, body = Some(bodyDoc))
+      val bodyLt   = LowerThird("probe-body", "Custom", "", body = Some(bodyDoc))
       val (bw, _, bargb) = analyzeCard(CardRenderer.renderCard(bodyLt, Style.broadcastBlue, 480, 270))
       check("body card width", bw, 480)
       check("body card argb32", bargb, true)
@@ -302,7 +302,7 @@ private[kutter] object Diagnostics:
       check("today iso dashes", (Project.today.charAt(4), Project.today.charAt(7)), ('-', '-'))
 
       // The fixed-track model: a blank project has the empty default tracks (V1, A1), no clips on them,
-      // and no overlays; a placement lands a bin clip on a track. Cover the model's shape and that a
+      // and no titles; a placement lands a bin clip on a track. Cover the model's shape and that a
       // session with edits survives the JSON round-trip the cache store uses.
       check("blank project empty", !Project.blank.hasMedia && Project.blank.lowerThirds.isEmpty, true)
       check("blank default tracks", Project.blank.tracks.map(_.name), List("V1", "A1"))
@@ -317,7 +317,7 @@ private[kutter] object Diagnostics:
         vp.videoTracks.head.clips.head.link == vp.audioTracks.head.clips.head.link && vp.videoTracks.head.clips.head.link.isDefined,
         true)
       val sess = Session(
-        vp.copy(lowerThirds = List(LowerThird("x", "Name", "Title", 0, 60))),
+        vp.copy(lowerThirds = List(LowerThird("x", "Name", "Title"))),
         Some("/path/proj.kutter"),
       )
       check("session roundtrip", sess.toJsonPretty.fromJson[Session], Right(sess))
@@ -347,13 +347,13 @@ private[kutter] object Diagnostics:
       check("levelDb silence finite", Mixer.levelDb(0.0) < -100.0, true)
 
       // Re-import replaces: lower thirds tagged with a source file are swapped out (not appended to) when
-      // that same file is imported again; overlays from other files or added by hand are untouched.
+      // that same file is imported again; titles from other files or added by hand are untouched.
       val existing = List(
-        LowerThird("a", "A", "", 0, 60, source = Some("f.klt")),
-        LowerThird("b", "B", "", 0, 60, source = Some("other.klt")),
-        LowerThird("c", "C", "", 0, 60, source = None),
+        LowerThird("a", "A", "", source = Some("f.klt")),
+        LowerThird("b", "B", "", source = Some("other.klt")),
+        LowerThird("c", "C", "", source = None),
       )
-      val reimported = List(LowerThird("a2", "A2", "", 0, 60, source = Some("f.klt")))
+      val reimported = List(LowerThird("a2", "A2", "", source = Some("f.klt")))
       val merged     = existing.filterNot(_.source.contains("f.klt")) ++ reimported
       check("reimport replaces source", merged.map(_.id), List("b", "c", "a2"))
 
@@ -485,6 +485,26 @@ private[kutter] object Diagnostics:
       check("dropClip V2 creates audio track", dvp5.audioTracks.size, 2)
       check("dropClip V2 new track paired", dvp5.audioTracks.last.clips.map(_.length), List(200))
 
+      // A title (a lower third from the library) dropped on a VIDEO track lands as a `titleId` placement
+      // for the default length passed; dropped on an AUDIO track it is rejected (the same project back).
+      // The block renders as a tinted card, not footage, so `clipId` is empty and `titleId` names the title.
+      val dcTitle = LowerThird("ttl", "Name", "Title")
+      val dcT     = Project.blank.copy(lowerThirds = List(dcTitle))
+      val dropped = Timeline.dropClip(dcT, "ttl", "v1", 40, 90)
+      check("dropClip title on v1", dropped.tracks.find(_.id == "v1").get.clips.map(c => (c.timelineStart, c.length, c.titleId)), List((40, 90, Some("ttl"))))
+      check("dropClip title no source", dropped.tracks.find(_.id == "v1").get.clips.head.clipId, "")
+      check("dropClip title on audio noop", Timeline.dropClip(dcT, "ttl", "a1", 0, 90) eq dcT, true)
+      check("dropClip unknown payload noop", Timeline.dropClip(dcT, "nope", "v1", 0, 90) eq dcT, true)
+
+      // A title placement survives the JSON round-trip, its titleId preserved so it resolves to its
+      // library content on load.
+      val titleProj = Project.blank.copy(
+        lowerThirds = List(dcTitle),
+        tracks = List(Track("v1", "V1", MediaKind.Video, List(PlacedClip.makeTitle("ttl", 0, 90))), Track("a1", "A1", MediaKind.Audio)),
+      )
+      check("title placement roundtrip", titleProj.toJson.fromJson[Project].map(_.tracks.head.clips.head.titleId), Right(Some("ttl")))
+      check("titleFor resolves", titleProj.titleFor("ttl").map(_.name), Some("Name"))
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true
@@ -496,8 +516,8 @@ private[kutter] object Diagnostics:
       @volatile var done = "no result"
       val t = new Thread(() =>
         try
-          val cairo = CardRenderer.renderCard(LowerThird("t1", "Name", "Title", 0, 60), Style.broadcastBlue, 640, 360)
-          val tex   = CardRenderer.renderCard(LowerThird("t2", "Name", "Title", 0, 60), Style.texishCard, 640, 360)
+          val cairo = CardRenderer.renderCard(LowerThird("t1", "Name", "Title"), Style.broadcastBlue, 640, 360)
+          val tex   = CardRenderer.renderCard(LowerThird("t2", "Name", "Title"), Style.texishCard, 640, 360)
           done = s"OK cairo=$cairo texish=$tex"
         catch case e: Throwable => done = s"THREW ${e}",
       )
@@ -512,10 +532,11 @@ private[kutter] object Diagnostics:
     // an NSException from MLT's producer loader).
     if sys.env.contains("KUTTER_PROBE_SWAP") then
       Mlt.init()
-      val base = videoProject("big_buck_bunny_720p.mp4")
-      val src  = Source.fromFile("examples/lower-thirds.klt")
-      val lts  = try BatchImport.parse(src.mkString, 30.0, "broadcast-blue").getOrElse(Nil) finally src.close()
-      println(s"swap off thread: ${Player.probeSwapOffThread(base, base.copy(lowerThirds = lts))}")
+      val base   = videoProject("big_buck_bunny_720p.mp4")
+      val src    = Source.fromFile("examples/lower-thirds.klt")
+      val titles = try BatchImport.parse(src.mkString, 30.0, "broadcast-blue").getOrElse(Nil) finally src.close()
+      val withT  = withTitles(base, titles.map(t => (t.lt, t.start, t.length)))
+      println(s"swap off thread: ${Player.probeSwapOffThread(base, withT)}")
       Mlt.close()
       return true
 
@@ -524,8 +545,8 @@ private[kutter] object Diagnostics:
     // footage.
     if sys.env.contains("KUTTER_PROBE_BLACK") then
       Mlt.init()
-      val proj = Project.blank.copy(lowerThirds = List(
-        LowerThird("t", "Jane Smith", "CEO, Acme", 0, 90, styleId = "texish-card"),
+      val proj = withTitles(Project.blank, List(
+        (LowerThird("t", "Jane Smith", "CEO, Acme", styleId = "texish-card"), 0, 90),
       ))
       Player.probe(proj, 45, "probe-black.png")
       Mlt.close()
@@ -538,12 +559,12 @@ private[kutter] object Diagnostics:
     // `CairoImageTypesetter` path (not just the CLI's PDF backend) and that the shipped template renders
     // without error, which is the point of a texish lower third with a background.
     if sys.env.contains("KUTTER_PROBE_CARD") then
-      val card = LowerThird("card", "Jane Smith", "CEO, Acme", 0, 90, styleId = "texish-card")
+      val card = LowerThird("card", "Jane Smith", "CEO, Acme", styleId = "texish-card")
       val out  = CardRenderer.renderCard(card, Style.texishCard, 1280, 720)
       println(s"texish-card wrote $out")
       // Composite the same card over real footage so the translucency reads over a picture, not gray.
       Mlt.init()
-      Player.probe(videoProject("big_buck_bunny_720p.mp4").copy(lowerThirds = List(card)), 45, "probe-card.png")
+      Player.probe(withTitles(videoProject("big_buck_bunny_720p.mp4"), List((card, 0, 90))), 45, "probe-card.png")
       Mlt.close()
       println("texish-card over video wrote probe-card.png")
       return true
@@ -558,16 +579,18 @@ private[kutter] object Diagnostics:
       Mlt.init()
       val vid = MediaClip.make("examples/sample-silent.mp4", MediaKind.Video)
       val aud = MediaClip.make("examples/sample-audio.mp4", MediaKind.Audio)
-      val proj = Project.blank.copy(
-        bin = List(vid, aud),
-        tracks = List(
-          Track("v1", "V1", MediaKind.Video, List(
-            PlacedClip.make(vid.id, 0, 120),
-            PlacedClip.make(vid.id, 180, 120), // a 60-frame gap before this one shows the black base
-          )),
-          Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(aud.id, 0, 300))),
+      val proj = withTitles(
+        Project.blank.copy(
+          bin = List(vid, aud),
+          tracks = List(
+            Track("v1", "V1", MediaKind.Video, List(
+              PlacedClip.make(vid.id, 0, 120),
+              PlacedClip.make(vid.id, 180, 120), // a 60-frame gap before this one shows the black base
+            )),
+            Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(aud.id, 0, 300))),
+          ),
         ),
-        lowerThirds = List(LowerThird("t", "Fixed tracks", "sequenced clips + audio", 10, 120, styleId = "broadcast-blue")),
+        List((LowerThird("t", "Fixed tracks", "sequenced clips + audio", styleId = "broadcast-blue"), 10, 110)),
       )
       val f = sys.env.get("KUTTER_PROBE_NLE").flatMap(_.toIntOption).getOrElse(40)
       Player.probe(proj, f, "probe-nle.png")
@@ -587,13 +610,15 @@ private[kutter] object Diagnostics:
       val spec = Player.probeSpec(src)
       val len  = math.min(60, Player.mediaLength(src, spec)) // a short clip keeps the encode quick
       val clip = MediaClip.make(src, MediaKind.Video, len)
-      val proj = Project.blank.withSpec(spec).copy(
-        bin = List(clip),
-        tracks = List(
-          Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(clip.id, 0, len, link = Some("k")))),
-          Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len, link = Some("k")))),
+      val proj = withTitles(
+        Project.blank.withSpec(spec).copy(
+          bin = List(clip),
+          tracks = List(
+            Track("v1", "V1", MediaKind.Video, List(PlacedClip.make(clip.id, 0, len, link = Some("k")))),
+            Track("a1", "A1", MediaKind.Audio, List(PlacedClip.make(clip.id, 0, len, link = Some("k")))),
+          ),
         ),
-        lowerThirds = List(LowerThird("t", "Exported", "from the timeline", 0, math.max(1, len - 1))),
+        List((LowerThird("t", "Exported", "from the timeline"), 0, math.max(1, len - 1))),
       )
       val job = Player.startRender(proj, out)
       var waited = 0

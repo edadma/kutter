@@ -35,11 +35,13 @@ private val BinPanel: Component[BinProps] = component[BinProps] { p =>
   def button(label: String, onClick: () => Unit): VNode = KutterUi.textButton(theme)(label, onClick)
 
   // One lower-third row: a selectable body (name over title) and a remove button. The selected row is
-  // filled with the primary colour so it reads as the inspector's subject.
+  // filled with the primary colour so it reads as the inspector's subject. The body is a drag source —
+  // its payload is the title id, which a video lane accepts as a drop to place the title on the timeline.
   def ltRow(lt: LowerThird): VNode =
     val selected = p.selectedLtId.contains(lt.id)
     row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
       box(onClick = _ => p.onSelectLt(lt.id), cursor = Cursor.Pointer, flex = 1, radius = 6,
+        dragPayload = lt.id,
         bg = if selected then theme.primary else theme.background,
         padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
         col(mainAxisSize = MainAxisSize.Min, spacing = 1)(
