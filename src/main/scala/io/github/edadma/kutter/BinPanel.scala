@@ -98,15 +98,16 @@ private val BinPanel: Component[BinProps] = component[BinProps] { p =>
         col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 4)(
           p.bin.map(binClipRow)*,
         ),
-      // Lower thirds section: import a `.klt` list or add one by hand — both work with or without footage.
+      // Titles section: import a `.klt` list or add one by hand — both work with or without footage.
+      // Drag a title onto a video track to place it; re-importing a `.klt` updates its titles in place.
       row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
-        text("Lower thirds", size = 11, weight = FontWeight.Bold, color = theme.border),
+        text("Titles", size = 11, weight = FontWeight.Bold, color = theme.border),
         spacer(),
         button("Import…", p.onImportLts),
         button("+ Add", p.onAddLt),
       ),
       box(flex = 1)(
-        if p.lowerThirds.isEmpty then KutterUi.placeholder(theme)("No lower thirds yet")
+        if p.lowerThirds.isEmpty then KutterUi.placeholder(theme)("No titles yet")
         else
           scrollView(axis = Axis.Vertical, scrollbar = true, scrollbarThumb = theme.border)(
             col(crossAxisAlignment = CrossAxisAlignment.Stretch, mainAxisSize = MainAxisSize.Min, spacing = 3)(

@@ -1038,7 +1038,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // over the track panel, the two divided by a draggable vertical splitter so the timeline area can
   // be sized. It starts compact.
   val topRow =
-    splitter(axis = Axis.Horizontal, initial = 0.18, min = 0.12, max = 0.4)(
+    splitter(axis = Axis.Horizontal, initial = 0.22, min = 0.16, max = 0.4)(
       binPanel,
       splitter(axis = Axis.Horizontal, initial = 0.74, min = 0.5, max = 0.86)(
         playerPanel,
