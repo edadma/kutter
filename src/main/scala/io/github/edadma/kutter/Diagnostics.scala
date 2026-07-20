@@ -406,6 +406,20 @@ private[kutter] object Diagnostics:
       // The group survives the JSON round-trip the project is saved through, angle sum type and all.
       check("mc json roundtrip", group.toJson.fromJson[Multicam], Right(group))
 
+      // Audio-waveform sync: recover a known delay between two peak envelopes by cross-correlation. A
+      // distinctive spike pattern and the same pattern delayed by 3 frames correlate best at lag 3 —
+      // a(i) lines up with b(i+3), so b's content trails a's by 3; a lead is a negative lag. Identical
+      // or flat envelopes have no lag to find (0). This is what auto-syncs a camera to the audio bed.
+      def env(spikes: Set[Int], n: Int): Array[Float] = Array.tabulate(n)(i => if spikes(i) then 1.0f else 0.1f)
+      val ea = env(Set(10, 20, 40), 60)
+      val eb = env(Set(13, 23, 43), 60) // the same spikes, 3 frames later
+      val ec = env(Set(7, 17, 37), 60)  // the same spikes, 3 frames earlier
+      check("sync bestLag trail", AudioSync.bestLag(ea, eb, 8), 3)
+      check("sync bestLag lead", AudioSync.bestLag(ea, ec, 8), -3)
+      check("sync offset", AudioSync.syncOffset(ea, eb, 8), 3)
+      check("sync self zero", AudioSync.bestLag(ea, ea, 8), 0)
+      check("sync flat zero", AudioSync.bestLag(Array.fill(60)(0.5f), Array.fill(60)(0.5f), 8), 0)
+
       println(if ok then "ALL PASS" else "FAILURES")
       if !ok then sys.exit(1)
       return true
@@ -569,6 +583,28 @@ private[kutter] object Diagnostics:
       println(s"multicam program: ${cuts.map(c => s"[${c.timelineStart},${c.timelineEnd})#${c.angle}").mkString(" ")}")
       println("multicam render wrote probe-mc-a.png (Cam A), probe-mc-b.png (Cam B), probe-mc-title.png (title slide)")
       println("multicam audio bed -> /tmp/kutter-mc-audio.wav (one continuous source across the cuts)")
+      return true
+
+    // `KUTTER_PROBE_SYNC` proves audio-waveform sync on a *real* clip's envelope, not just clean synthetic
+    // spikes: it generates the peak envelope of a source, makes a copy delayed by a known number of frames,
+    // and confirms the cross-correlation recovers exactly that delay. This is the auto-sync that lines a
+    // camera up with the audio bed; the synthetic cases live in `KUTTER_PROBE_HIT`.
+    if sys.env.contains("KUTTER_PROBE_SYNC") then
+      Mlt.init()
+      val src = "big_buck_bunny_720p.mp4"
+      val n   = math.min(300, Player.mediaLength(src, TimelineSpec.default))
+      val wf  = new Waveform(n)
+      wf.start(TimelineSpec.default, src)
+      wf.awaitComplete()
+      val envelope = wf.envelope
+      wf.close()
+      Mlt.close()
+      val delay   = 12
+      val shifted = Array.tabulate(envelope.length)(i => if i - delay >= 0 then envelope(i - delay) else 0f)
+      val got     = AudioSync.bestLag(envelope, shifted, 40)
+      println(s"sync: real envelope ${envelope.length} frames, injected delay=$delay, recovered=$got")
+      if got != delay then { println("SYNC PROBE FAILED"); sys.exit(1) }
+      println("SYNC PROBE OK")
       return true
 
     false

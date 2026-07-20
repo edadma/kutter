@@ -30,6 +30,10 @@ final class Waveform(count: Int):
     val i = math.max(0, math.min(count - 1, (fraction * count).toInt))
     if i < made then peaks(i) else 0f
 
+  /** A snapshot of the peak envelope generated so far — one peak per frame — for audio-waveform sync
+    * (see [[AudioSync]]). A copy, so the caller can hold it while the generator runs on. */
+  def envelope: Array[Float] = peaks.take(made).clone()
+
   /** Spawn the background generator: its own graph rendering `path` against the timeline `spec`. */
   def start(spec: TimelineSpec, path: String): Unit =
     val t = new Thread(() => generate(spec, path), "kutter-waveform")
@@ -39,6 +43,13 @@ final class Waveform(count: Int):
 
   def close(): Unit =
     stopping = true
+    thread match
+      case t: Thread => t.join()
+      case null      => ()
+
+  /** Block until the background generator has run to completion (every frame's peak made, or end of
+    * stream), without stopping it. For offline audio-sync analysis that needs the whole envelope. */
+  def awaitComplete(): Unit =
     thread match
       case t: Thread => t.join()
       case null      => ()
