@@ -84,6 +84,20 @@ private val App: Component[Session] = component[Session] { initial =>
   val (exportSettingsOpen, setExportSettingsOpen, _)       = useState(false)
   val (exportDraft, setExportDraft, updateExportDraft)     = useState(ExportSettings.default)
 
+  // Undo/redo history. Each edit records the project state *before* it on the undo stack; undo pops that
+  // back (pushing the current onto redo) and redo reverses it. A history effect below watches the project
+  // and records every change uniformly — whether it went through the live-swap edit path or a re-open —
+  // so imports, placements, cuts, trims, and deletes are all undoable. A drag or trim folds into one entry
+  // via the coalescing refs (it would otherwise record one per frame). The stacks are state so the toolbar
+  // buttons enable and disable as they fill and empty; the guards are refs (read imperatively, no render).
+  val (undoStack, setUndoStack, updateUndoStack) = useState[List[Project]](Nil)
+  val (redoStack, setRedoStack, updateRedoStack) = useState[List[Project]](Nil)
+  val histPrev   = useRef(initial.project) // the project as of the last history tick
+  val histSkip   = useRef(false)           // set by undo/redo/open so their own change is not recorded
+  val coalescing = useRef(false)           // true across a drag/trim, folding its frames into one entry
+  val coalesced  = useRef(false)           // whether the current coalesced run already recorded its entry
+  val HistoryLimit = 100
+
   // The video layer, once the player has opened the project and created its texture. Null until the
   // mount effect runs, so the first render shows a placeholder rather than an empty hole.
   val (layer, setLayer, _) = useState[VideoLayer | Null](null)
@@ -296,6 +310,26 @@ private val App: Component[Session] = component[Session] { initial =>
     Array(project),
   )
 
+  // Record undo history on every project change. The pre-change project (`histPrev`) is pushed onto the
+  // undo stack, and a new edit clears the redo stack (redo only survives consecutive undos). A change from
+  // undo/redo/open is skipped (`histSkip`); a drag/trim records only its first frame (`coalescing` folds
+  // the rest into that one entry).
+  useEffect(
+    () =>
+      if histPrev.current ne project then
+        if histSkip.current then histSkip.current = false
+        else if coalescing.current && coalesced.current then () // same drag, its entry is already recorded
+        else
+          val base = histPrev.current
+          updateUndoStack(s => (base :: s).take(HistoryLimit))
+          setRedoStack(Nil)
+          if coalescing.current then coalesced.current = true
+        histPrev.current = project
+      () => ()
+    ,
+    Array(project),
+  )
+
   // Keep the window title naming the bound file (via suit's WindowControl seam, installed by the
   // runtime), so the title bar reads "kutter — project.kutter" once saved or opened.
   useEffect(
@@ -326,6 +360,49 @@ private val App: Component[Session] = component[Session] { initial =>
   def editProject(f: Project => Project): Unit =
     dirty.current = true
     updateProject(f)
+
+  // A drag or trim is one undoable action, not one per frame: the timeline calls these at its start and
+  // end so the history effect folds every frame between them into a single entry (the pre-drag state).
+  def beginCoalesce(): Unit =
+    coalescing.current = true
+    coalesced.current  = false
+  def endCoalesce(): Unit = coalescing.current = false
+
+  // Undo/redo: restore the neighbouring project state, moving the current one to the other stack. The
+  // change is flagged so the history effect does not re-record it, and it flows to the player through the
+  // ordinary graph-push effect (a structural difference triggers a live rebuild). Marks the project
+  // unsaved, since undoing is itself a change relative to the last save.
+  def undo(): Unit =
+    undoStack match
+      case prev :: rest =>
+        histSkip.current = true
+        updateRedoStack(project :: _)
+        setUndoStack(rest)
+        setSelectedClipId(None)
+        setSelectedId(None)
+        dirty.current = true
+        setProject(prev)
+      case Nil => ()
+
+  def redo(): Unit =
+    redoStack match
+      case next :: rest =>
+        histSkip.current = true
+        updateUndoStack(s => (project :: s).take(HistoryLimit))
+        setRedoStack(rest)
+        setSelectedClipId(None)
+        setSelectedId(None)
+        dirty.current = true
+        setProject(next)
+      case Nil => ()
+
+  // Forget all history — used when the project is replaced wholesale (New/Open), since undo must not
+  // cross into a different project. The imminent project change is flagged so the load is not itself
+  // recorded as an undoable step.
+  def clearHistory(): Unit =
+    setUndoStack(Nil)
+    setRedoStack(Nil)
+    histSkip.current = true
 
   // Edit the one lower third with `id`, leaving the rest untouched.
   def editLt(id: String, f: LowerThird => LowerThird): Unit =
@@ -504,6 +581,7 @@ private val App: Component[Session] = component[Session] { initial =>
   def newProject(): Unit =
     teardownPlayer()
     dirty.current = false
+    clearHistory()
     setProject(Project.blank)
     setSelectedId(None)
     setPath(None)
@@ -746,6 +824,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // to the old arrangement, so re-open from scratch.
   def applyOpened(p: Project, loadedPath: String): Unit =
     dirty.current = false // freshly loaded from disk, so it matches its file
+    clearHistory()        // undo does not cross an open into a different project
     resetView()
     if playerRef.current != null && mediaKey(p) == mediaKey(project) then
       setProject(p)
@@ -1029,7 +1108,7 @@ private val App: Component[Session] = component[Session] { initial =>
   // and just re-windows the two halves, so the generators are unchanged and it rides the live graph-swap
   // (like a trim), not a re-open. Nothing to cut at the playhead is a no-op. The selection is cleared,
   // since the clip it named may no longer exist as one piece.
-  def splitAtPlayhead(): Unit =
+  def cutAtPlayhead(): Unit =
     val f = playheadRef.current
     if project.splittableAt(f) then
       setSelectedClipId(None)
@@ -1061,7 +1140,13 @@ private val App: Component[Session] = component[Session] { initial =>
     onRemoveLowerThird  = removeLowerThird,
     onAddTrack          = addTrack,
     onAddAvTracks       = () => addAvTracks(),
-    onSplit             = () => splitAtPlayhead(),
+    onCut               = () => cutAtPlayhead(),
+    onUndo              = () => undo(),
+    onRedo              = () => redo(),
+    canUndo             = undoStack.nonEmpty,
+    canRedo             = redoStack.nonEmpty,
+    onDragBegin         = () => beginCoalesce(),
+    onDragEnd           = () => endCoalesce(),
   ))
 
   // The editor body, Resolve-style: a top row of bin | player | inspector — split by draggable

@@ -37,7 +37,13 @@ private final case class TimelineProps(
     onRemoveLowerThird:  String => Unit,
     onAddTrack:          MediaKind => Unit,
     onAddAvTracks:       () => Unit,
-    onSplit:             () => Unit,
+    onCut:               () => Unit,
+    onUndo:              () => Unit,
+    onRedo:              () => Unit,
+    canUndo:             Boolean,
+    canRedo:             Boolean,
+    onDragBegin:         () => Unit,
+    onDragEnd:           () => Unit,
 )
 
 private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] { p =>
@@ -277,6 +283,7 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
   // neighbour while the other moves. A press that doesn't move stays a plain selection.
   def beginClipDrag(id: String, grabFrame: Int): Unit =
     focusProjectMonitor()
+    p.onDragBegin() // a whole move is one undo step, not one per frame
     selectClip(id)
     val group = project.moveGroupOf(id)
     if group.nonEmpty then
@@ -327,7 +334,9 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       case null => ()
 
   // End a clip drag.
-  def endClipDrag(): Unit = cdragId.current = null
+  def endClipDrag(): Unit =
+    if cdragId.current != null then p.onDragEnd()
+    cdragId.current = null
 
   // The source length a placement can be trimmed against: the measured source frame count, or — for a
   // clip from a project saved before lengths were measured — the placement's own end, so an old clip
@@ -343,6 +352,7 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
   // the source or over a neighbour.
   def beginTrim(id: String, edge: Timeline.TrimEdge, grabFrame: Int): Unit =
     focusProjectMonitor()
+    p.onDragBegin() // a whole trim is one undo step, not one per frame
     selectClip(id)
     val group = project.moveGroupOf(id)
     if group.nonEmpty then
@@ -398,7 +408,9 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       case null => ()
 
   // End a trim.
-  def endTrim(): Unit = tdragId.current = null
+  def endTrim(): Unit =
+    if tdragId.current != null then p.onDragEnd()
+    tdragId.current = null
 
   // The lane colour for a lower third, drawn from its style so a block on the timeline reads as the
   // look it wears: the accent stripe if the style has one, else the bar if it is solid enough, else
@@ -612,11 +624,13 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
   // it and focuses the panel; the key then reaches here. A text field editing an overlay's words keeps its
   // own focus, so Backspace there still edits text rather than deleting a clip.
   def onKey(e: KeyEvent): Unit =
-    if e.scancode == Key.Delete || e.scancode == Key.Backspace then
+    val primary = e.meta || e.ctrl // ⌘ on macOS, Ctrl elsewhere
+    if primary && e.scancode == Key.Z then (if e.shift then p.onRedo() else p.onUndo())
+    else if e.scancode == Key.Delete || e.scancode == Key.Backspace then
       selectedClipId match
         case Some(id) => p.onRemovePlacement(id)
         case None     => selectedId.foreach(p.onRemoveLowerThird)
-    else if e.scancode == Key.S then p.onSplit() // the razor: cut every clip at the playhead
+    else if e.scancode == Key.S then p.onCut() // the razor: cut every clip at the playhead
 
   // The track panel: a card with the pinned ruler over a vertical scroll view of the track widgets, so
   // a tall stack scrolls while the ruler stays put. Each track is its own widget inside the panel rather
@@ -643,7 +657,10 @@ private val TimelinePanel: Component[TimelineProps] = component[TimelineProps] {
       box(bg = theme.background, padding = EdgeInsets.symmetric(horizontal = 8, vertical = 6))(
         row(crossAxisAlignment = CrossAxisAlignment.Center, spacing = 6)(
           // The razor: cut every clip at the playhead (also the S key when the timeline has focus).
-          KutterUi.textButton(theme)("✂ Split", () => p.onSplit()),
+          KutterUi.textButton(theme)("Cut", () => p.onCut()),
+          // Undo / redo the last edit (also ⌘Z / ⌘⇧Z when the timeline has focus). Dimmed when empty.
+          KutterUi.textButton(theme)("Undo", () => p.onUndo(), enabled = p.canUndo),
+          KutterUi.textButton(theme)("Redo", () => p.onRedo(), enabled = p.canRedo),
           spacer(),
           KutterUi.textButton(theme)("+ A/V", () => p.onAddAvTracks()),
           KutterUi.textButton(theme)("+ Video", () => p.onAddTrack(MediaKind.Video)),
